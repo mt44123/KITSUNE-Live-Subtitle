@@ -123,6 +123,12 @@ impl LinearResampler {
 /// Whisper へ渡す 1 チャンクのサンプル数（16kHz モノラルで約1秒分）。
 const CHUNK_SIZE: usize = 16_000;
 
+/// Rolling window で Whisper へ渡す音声の最大サンプル数（16kHz モノラルで約5秒分）。
+///
+/// ワーカーは受信した約1秒チャンクを順に貯め、直近このサンプル数までを 1 回の推論に
+/// 使う。これを超えた分は最古のサンプルから捨てるため、バッファは無制限に伸びない。
+const WHISPER_WINDOW_SAMPLES: usize = 16_000 * 5;
+
 /// 16kHz モノラルサンプルを固定長（CHUNK_SIZE）まで貯めるバッファ。
 ///
 /// `push` で 1 サンプルずつ追加し、CHUNK_SIZE 揃ったら `Vec<f32>` を返す。
@@ -191,17 +197,18 @@ struct TranscriptionPayload {
 /// 保持する音声は「収集中の1チャンク + キュー内数チャンク + 処理中の1チャンク」に収まる。
 const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
 
-/// 1 チャンク（16kHz / mono / f32 / 16000 サンプル ≒ 1 秒）を Whisper で推論し、
-/// 認識テキストをコンソールへ出す。
+/// Rolling window（16kHz / mono / f32 / 最大 WHISPER_WINDOW_SAMPLES ≒ 5 秒）を
+/// Whisper で推論し、認識テキストをコンソールへ出す。
 ///
 /// `state` はワーカーが所有し、チャンクごとに使い回す（毎チャンク作り直さない）。
 /// whisper.cpp の `whisper_full_with_state` は呼び出しごとに内部の推論結果を上書き
-/// するため、同じ `WhisperState` を連続して `full()` に渡して問題ない。各チャンクは
-/// 独立した約1秒の音声なので、直前チャンクの結果をプロンプトに引きずらないよう
-/// `set_no_context(true)` で毎回コンテキストをリセットする（rolling window ではない）。
+/// するため、同じ `WhisperState` を連続して `full()` に渡して問題ない。直近5秒分の
+/// 音声そのものを毎回渡すため、whisper 内部の過去テキストコンテキストは使わず
+/// `set_no_context(true)` で毎回リセットする（コンテキストは音声バッファ側が持つ）。
 ///
-/// `FullParams` は軽量なのでチャンクごとに新規生成する。入力 `samples` は借用のまま
-/// 渡し、`Vec<f32>` の clone や再変換は行わない。
+/// `FullParams` は軽量なので呼び出しごとに新規生成する。入力 `samples` はワーカーの
+/// rolling window の借用スライスをそのまま受け取り、`Vec<f32>` の clone や再変換は
+/// 行わない。
 ///
 /// 失敗（推論失敗 / segment 取得失敗）は panic せず、呼び出し側が 1 チャンク分だけ
 /// ログして次チャンクへ進めるよう、説明的な `Err(String)` を返す。
@@ -273,8 +280,13 @@ fn transcribe_chunk(
     Ok(())
 }
 
-/// 受信した完成チャンクのサイズ・RMS をログし、Whisper モデルが利用可能なら推論して
-/// 認識テキストを表示するオーディオワーカースレッドを起動する。
+/// 受信した完成チャンクのサイズ・RMS をログし、直近最大5秒分の rolling window を
+/// 使って Whisper モデルが利用可能なら推論し、認識テキストを表示するオーディオ
+/// ワーカースレッドを起動する。
+///
+/// Rolling window（`rolling_samples`）はこのワーカースレッドだけが所有し、cpal
+/// コールバックやグローバル State では管理しない。約1秒チャンクを受信するたびに末尾へ
+/// 追加し、`WHISPER_WINDOW_SAMPLES` を超えた最古のサンプルを捨てて上限を保つ。
 ///
 /// Whisper 推論は必ずこのワーカー側で実行し、リアルタイムな cpal コールバックでは
 /// 行わない。`whisper_context` は Start 時に State から clone した `Arc` を受け取る
@@ -322,6 +334,11 @@ fn spawn_audio_worker(
             }
         };
 
+        // Rolling window 用のローカルバッファ。ワーカースレッドだけが所有し、
+        // グローバル State には保存しない。ワーカー終了時（Stop）に自然に drop され、
+        // 再 Start では新しいワーカーが空の状態から作り直す。
+        let mut rolling_samples: Vec<f32> = Vec::with_capacity(WHISPER_WINDOW_SAMPLES);
+
         // 送信側が生存する限りブロックして待ち、切断後は残りを受信して抜ける。
         for chunk in chunk_receiver.iter() {
             // RMS 計算はコールバック外（ワーカー側）で行い、リアルタイム性を確保する。
@@ -329,9 +346,27 @@ fn spawn_audio_worker(
             println!("Worker received audio chunk: {} samples", chunk.len());
             println!("Worker chunk RMS: {rms:.6}");
 
-            // モデルが利用可能なチャンクだけ推論する。エラーは1チャンク分ログして継続。
+            // 1. 受信チャンクを rolling window の末尾へ追加する（新しい音声）。
+            rolling_samples.extend_from_slice(&chunk);
+            // 2. 上限を超えたら最古のサンプルから削除し、常に <= WHISPER_WINDOW_SAMPLES に保つ。
+            //    drain は Vec を縮小するだけで再確保しないため、毎秒の余計な allocation を避ける。
+            if rolling_samples.len() > WHISPER_WINDOW_SAMPLES {
+                let overflow = rolling_samples.len() - WHISPER_WINDOW_SAMPLES;
+                rolling_samples.drain(0..overflow);
+            }
+
+            // モデルが利用可能なときだけ、直近最大5秒分を推論する。
+            // エラーは1チャンク分ログして継続（ワーカーは止めない）。
             if let Some(state) = whisper_state.as_mut() {
-                if let Err(error) = transcribe_chunk(&app, state, &chunk) {
+                // 推論直前に window の実サイズと秒数を1行だけログする（rolling window の実機確認用）。
+                let window_seconds = rolling_samples.len() as f64 / TARGET_SAMPLE_RATE as f64;
+                println!(
+                    "Whisper window: {} samples ({:.2} seconds)",
+                    rolling_samples.len(),
+                    window_seconds
+                );
+                // rolling window 全体を借用のまま渡す（1秒チャンク単体ではない / clone しない）。
+                if let Err(error) = transcribe_chunk(&app, state, rolling_samples.as_slice()) {
                     eprintln!("{error}");
                 }
             }
