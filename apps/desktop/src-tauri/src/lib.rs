@@ -1,7 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, StreamConfig};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::thread;
+use whisper_rs::{WhisperContext, WhisperContextParameters};
 
 /// 出力オーディオデバイスを列挙し、既定の出力デバイス名をターミナルに表示する。
 ///
@@ -478,15 +480,117 @@ fn stop_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
     }
 }
 
+// ===========================================================================
+// Whisper モデル読み込み（Phase 3 の最初のステップ）
+//
+// この節は「手動配置された Whisper モデルを一度だけ安全に読み込み、結果を UI へ
+// 返す」ことだけを担当する。音声チャンクの推論・文字起こしはまだ行わず、既存の
+// 音声キャプチャ処理（WASAPI ループバック / モノラル化 / リサンプル / チャンク化 /
+// bounded channel / ワーカー）とは完全に独立している。audio worker は Whisper
+// context へアクセスしない。
+// ===========================================================================
+
+/// 読み込む Whisper モデルのファイル名。今回は base モデルを想定する。
+const WHISPER_MODEL_FILE_NAME: &str = "ggml-base.bin";
+
+/// リポジトリ内の Whisper モデルファイルの絶対パスを解決する。
+///
+/// PC 固有の絶対パス（例: `C:\Users\...`）をソースへ書かないため、コンパイル時に
+/// 確定する `CARGO_MANIFEST_DIR`（= この crate の `src-tauri` ディレクトリ）を
+/// 基準に `models/ggml-base.bin` を指す。開発環境（`tauri dev`）ではこの相対配置
+/// で確実に読み込める。
+///
+/// 将来の配布時は Tauri の resource ディレクトリ等へ切り替える余地があるが、今回は
+/// 開発環境で確実に読めることを優先し、リポジトリ内相対パスのみを解決する。
+fn resolve_whisper_model_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join(WHISPER_MODEL_FILE_NAME)
+}
+
+/// Tauri State として保持する Whisper モデルの状態。
+///
+/// 読み込み済みの `WhisperContext` を `Mutex<Option<...>>` で保持し、コマンド呼び出し
+/// ごとの再読み込みを防ぐ（`None` なら未読み込み、`Some` なら読み込み済み）。
+///
+/// `WhisperContext` は whisper-rs 側でスレッド安全に実装されている（`Send` + `Sync`）
+/// ため、この crate 側で `unsafe impl Send/Sync` や `static mut`、生ポインタ共有を
+/// 使わずに、そのまま Tauri State（内部で `Send + Sync` を要求）へ安全に保持できる。
+#[derive(Default)]
+struct WhisperModelState {
+    context: Mutex<Option<WhisperContext>>,
+}
+
+/// 手動配置された Whisper モデルを読み込み、Tauri State へ保存する。
+///
+/// 処理の流れ:
+/// 1. すでに読み込み済みなら再ロードせず「既に読み込み済み」を成功として返す。
+/// 2. モデルパスを解決し、ファイルの存在を確認する（無ければ分かりやすい Err）。
+/// 3. `spawn_blocking` 上で `WhisperContext` を生成する（重い処理で UI/メイン
+///    スレッドをブロックしないため）。
+/// 4. 生成した context を State へ保存する。
+///
+/// `unwrap()` や `panic!` でアプリを終了させず、失敗はすべて文字列 Err で返す。
+/// 非同期コマンドにすることで、読み込み中も Tauri のメインスレッドを塞がない。
+#[tauri::command]
+async fn load_whisper_model(state: tauri::State<'_, WhisperModelState>) -> Result<String, String> {
+    // すでに読み込み済みなら再ロードしない（メモリの無駄遣いと二重ロードを防ぐ）。
+    // ロックは await をまたいで保持しないよう、ここで一旦解放する。
+    {
+        let guard = state
+            .context
+            .lock()
+            .map_err(|_| "Whisper モデルの内部状態のロックに失敗しました。".to_string())?;
+        if guard.is_some() {
+            return Ok("Whisper model is already loaded".to_string());
+        }
+    }
+
+    let model_path = resolve_whisper_model_path();
+    if !model_path.exists() {
+        return Err(format!(
+            "Whisper model file not found: {}",
+            model_path.display()
+        ));
+    }
+
+    // モデル読み込みは重い可能性があるため、ブロッキング専用スレッドで生成する。
+    // 生成した WhisperContext は Send なのでスレッドをまたいで受け取れる。
+    let context = tauri::async_runtime::spawn_blocking(move || {
+        // 今回は CPU 実行のみ。GPU は明示的に無効化する。
+        let parameters = WhisperContextParameters {
+            use_gpu: false,
+            ..Default::default()
+        };
+        WhisperContext::new_with_params(&model_path, parameters)
+    })
+    .await
+    .map_err(|error| format!("Failed to load Whisper model: {error}"))?
+    .map_err(|error| format!("Failed to load Whisper model: {error}"))?;
+
+    // 読み込み中に別の呼び出しが先に完了していた場合は、そちらを尊重して破棄する。
+    let mut guard = state
+        .context
+        .lock()
+        .map_err(|_| "Whisper モデルの内部状態のロックに失敗しました。".to_string())?;
+    if guard.is_some() {
+        return Ok("Whisper model is already loaded".to_string());
+    }
+    *guard = Some(context);
+    Ok("Whisper model loaded successfully".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(CaptureState::default())
+        .manage(WhisperModelState::default())
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             start_audio_capture,
-            stop_audio_capture
+            stop_audio_capture,
+            load_whisper_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

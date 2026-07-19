@@ -1,0 +1,10 @@
+# Place the Whisper model file here (not committed to git).
+#
+# Expected file:
+#   apps/desktop/src-tauri/models/ggml-base.bin
+#
+# Download example (ggml-base, multilingual):
+#   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+#
+# The model file is resolved at runtime relative to CARGO_MANIFEST_DIR,
+# so keep the file name exactly `ggml-base.bin`.

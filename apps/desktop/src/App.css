@@ -160,6 +160,12 @@ body {
   border: 1px solid #4a2f2f;
 }
 
+.status-text {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #b7bdc8;
+}
+
 .device-list {
   display: flex;
   flex-direction: column;

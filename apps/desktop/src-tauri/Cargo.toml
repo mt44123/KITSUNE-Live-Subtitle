@@ -28,4 +28,10 @@ serde_json = "1"
 # Tauri が固定する `windows 0.61` と衝突してビルドが壊れる。0.17 は `windows`
 # 本体のみに依存するため Tauri と同じバージョンに一本化でき、追加依存も増えない。
 cpal = "0.17.0"
+# whisper.cpp の Rust バインディング。今回は手動配置した Whisper モデルの
+# 読み込みだけに使用する（推論はまだ行わない）。
+# CPU 実行のみ: default features は空で GPU 系 feature（cuda / vulkan / metal /
+# coreml / hipblas / intel-sycl）は一切有効化しない。`default-features = false`
+# を明示して、将来 default に何か追加されても GPU が混入しないようにする。
+whisper-rs = { version = "0.16", default-features = false }
 

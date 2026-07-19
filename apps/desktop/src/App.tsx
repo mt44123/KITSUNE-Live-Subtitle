@@ -20,6 +20,15 @@ const CAPTURE_BUTTON_LABEL: Record<CaptureStatus, string> = {
   stopping: "Stopping...",
 };
 
+// Whisper モデルの読み込み状態。unloaded=未読み込み, loading=読み込み中, loaded=読み込み済み。
+type WhisperStatus = "unloaded" | "loading" | "loaded";
+
+const WHISPER_STATUS_TEXT: Record<WhisperStatus, string> = {
+  unloaded: "Whisper model not loaded",
+  loading: "Loading Whisper model...",
+  loaded: "Whisper model loaded successfully",
+};
+
 function App() {
   const [inputLanguage, setInputLanguage] = useState("Auto Detect");
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
@@ -30,6 +39,10 @@ function App() {
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [isCheckingDevices, setIsCheckingDevices] = useState(false);
   const [deviceError, setDeviceError] = useState<string | null>(null);
+
+  const [whisperStatus, setWhisperStatus] = useState<WhisperStatus>("unloaded");
+  const [whisperMessage, setWhisperMessage] = useState<string | null>(null);
+  const [whisperError, setWhisperError] = useState<string | null>(null);
 
   const startCapture = async () => {
     setCaptureError(null);
@@ -71,6 +84,29 @@ function App() {
 
   const isCaptureTransitioning =
     captureStatus === "starting" || captureStatus === "stopping";
+
+  // Whisper モデルの読み込み。Promise として扱い、読み込み中は同じボタンを
+  // 連打できないようにする（loading 中は早期 return + ボタン disabled）。
+  const loadWhisperModel = async () => {
+    if (whisperStatus === "loading") {
+      return;
+    }
+    setWhisperError(null);
+    setWhisperStatus("loading");
+    try {
+      const message = await invoke<string>("load_whisper_model");
+      setWhisperStatus("loaded");
+      setWhisperMessage(message);
+    } catch (error) {
+      setWhisperStatus("unloaded");
+      setWhisperMessage(null);
+      setWhisperError(
+        typeof error === "string"
+          ? error
+          : "Whisper モデルの読み込みに失敗しました。"
+      );
+    }
+  };
 
   const checkAudioDevices = async () => {
     setIsCheckingDevices(true);
@@ -135,6 +171,26 @@ function App() {
             </ul>
           </div>
         )}
+      </section>
+
+      <section className="panel">
+        <h2 className="panel-title">Speech Engine</h2>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={loadWhisperModel}
+          disabled={whisperStatus === "loading"}
+        >
+          {whisperStatus === "loading" ? "Loading..." : "Load Whisper Model"}
+        </button>
+
+        <p className="status-text">
+          {whisperStatus === "loaded" && whisperMessage
+            ? whisperMessage
+            : WHISPER_STATUS_TEXT[whisperStatus]}
+        </p>
+
+        {whisperError && <p className="device-error">{whisperError}</p>}
       </section>
 
       <section className="panel">
