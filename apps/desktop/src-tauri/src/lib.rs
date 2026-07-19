@@ -163,11 +163,45 @@ fn chunk_rms(samples: &[f32]) -> f64 {
     (sum_of_squares / samples.len() as f64).sqrt()
 }
 
+/// オーディオコールバックからワーカーへ完成チャンクを渡す bounded channel の容量。
+///
+/// 有限容量にすることで、将来 Whisper 推論が入力より遅れてもキューが無制限に伸びず、
+/// 保持する音声は「収集中の1チャンク + キュー内数チャンク + 処理中の1チャンク」に収まる。
+const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
+
+/// 受信した完成チャンクのサイズと RMS を表示するオーディオワーカースレッドを起動する。
+///
+/// 目的は、将来の Whisper 推論をリアルタイムなオーディオコールバックの外で実行できる
+/// 構造を先に用意すること。今回はサイズと RMS のログ表示のみを行う。
+///
+/// `receiver.iter()` は送信側（コールバック内の `SyncSender`）が drop されるまで
+/// チャンクを1つずつ返し、drop（切断）後はキュー内の残りを受信し終えてから終了する
+/// （推奨A: 停止時にキュー内の完成チャンクを取りこぼさない）。
+fn spawn_audio_worker(chunk_receiver: mpsc::Receiver<Vec<f32>>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        println!("Audio worker started");
+        // 送信側が生存する限りブロックして待ち、切断後は残りを受信して抜ける。
+        for chunk in chunk_receiver.iter() {
+            // RMS 計算はコールバック外（ワーカー側）で行い、リアルタイム性を確保する。
+            let rms = chunk_rms(&chunk);
+            println!("Worker received audio chunk: {} samples", chunk.len());
+            println!("Worker chunk RMS: {rms:.6}");
+        }
+        println!("Audio worker stopped");
+    })
+}
+
 /// ループバック用の入力ストリームを構築する（Whisper 前処理: モノラル化 + 16kHz + 固定長チャンク化）。
 ///
 /// コールバックでは、インターリーブ入力をフレーム単位（1フレーム = 全チャンネル）でモノラル化し、
 /// 線形補間リサンプラーで 16kHz へ変換したサンプルを `AudioChunkBuffer` へ順番に push する。
-/// CHUNK_SIZE(16000) 揃うたびに `Vec<f32>` を取り出して RMS を表示する（チャンク自体は保持しない）。
+/// CHUNK_SIZE(16000) 揃うたびに完成した `Vec<f32>` を `chunk_sender.try_send` でワーカーへ渡す。
+///
+/// リアルタイム性を守るため、コールバック内では RMS 計算やログ表示・重い処理・待機・
+/// ブロッキング送信は行わない。送信はノンブロッキングな `try_send` のみで、
+/// - 成功時: チャンクの所有権をワーカーへ移動する（clone しない）。
+/// - `Full`: キューに空きがないので、そのチャンクをその場で破棄し1回だけログを出す。
+/// - `Disconnected`: ワーカーが終了済み。破棄し、最初の1回だけログを出す（毎回は出さない）。
 ///
 /// サンプル形式(f32 / i16 / u16)ごとに同じ処理を使い回すためジェネリックにし、
 /// 各形式を概ね -1.0〜1.0 に正規化する関数 `normalize` を引数で受け取る。
@@ -176,6 +210,7 @@ fn build_chunking_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     mut resampler: LinearResampler,
+    chunk_sender: mpsc::SyncSender<Vec<f32>>,
     normalize: fn(T) -> f64,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -186,6 +221,9 @@ where
 
     // 収集中のチャンクバッファ。ストリーム生成のたびに新規作成され、再 Start で持ち越さない。
     let mut chunk_buffer = AudioChunkBuffer::new();
+
+    // Disconnected を毎チャンク記録しないための1回きりフラグ（move クロージャ内で保持）。
+    let mut disconnect_logged = false;
 
     device.build_input_stream::<T, _, _>(
         config,
@@ -202,11 +240,27 @@ where
                 // モノラルサンプルを 16kHz へ変換し、チャンクへ push する。
                 resampler.process_sample(mono, |resampled| {
                     if let Some(chunk) = chunk_buffer.push(resampled) {
-                        // チャンク完成時だけログを出す（毎サンプルの println はしない）。
-                        // 将来はここで chunk を Whisper へ渡す。今は表示のみで破棄する。
-                        let rms = chunk_rms(&chunk);
-                        println!("Generated audio chunk: {} samples", chunk.len());
-                        println!("Chunk RMS: {rms:.6}");
+                        // 完成チャンクはノンブロッキングでワーカーへ「移動」する。
+                        // 成功時は clone せず所有権が移る。ここでは RMS もログも出さない。
+                        match chunk_sender.try_send(chunk) {
+                            Ok(()) => {}
+                            // キュー満杯: 返ってきたチャンクをその場で破棄（drop）する。
+                            Err(mpsc::TrySendError::Full(dropped)) => {
+                                eprintln!(
+                                    "Audio chunk queue full; dropping {}-sample chunk",
+                                    dropped.len()
+                                );
+                            }
+                            // ワーカー終了済み: 破棄し、最初の1回だけ通知する。
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                if !disconnect_logged {
+                                    eprintln!(
+                                        "Audio worker disconnected; dropping chunks until stop"
+                                    );
+                                    disconnect_logged = true;
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -221,7 +275,11 @@ where
 /// cpal では「出力デバイスに対して build_input_stream を呼ぶ」とループバックになる。
 /// cpal の Stream はスレッドをまたいで送れないため、この関数は必ずキャプチャ用の
 /// 専用スレッド内で呼び出し、生成した Stream もそのスレッドで保持する。
-fn open_loopback_stream() -> Result<cpal::Stream, String> {
+///
+/// `chunk_sender` は完成チャンクをワーカーへ渡すための bounded channel の送信側。
+/// 成功時は Stream（内部のコールバック）が所有し、Stream が drop されると送信側も
+/// drop されてワーカーが切断を検知する。失敗時はこの関数の終了時に drop される。
+fn open_loopback_stream(chunk_sender: mpsc::SyncSender<Vec<f32>>) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().ok_or_else(|| {
@@ -250,21 +308,29 @@ fn open_loopback_stream() -> Result<cpal::Stream, String> {
 
     let stream = match sample_format {
         // f32 はそのまま(概ね -1.0〜1.0)。
-        SampleFormat::F32 => {
-            build_chunking_input_stream::<f32>(&device, &config, resampler, |sample| sample as f64)
-        }
+        SampleFormat::F32 => build_chunking_input_stream::<f32>(
+            &device,
+            &config,
+            resampler,
+            chunk_sender,
+            |sample| sample as f64,
+        ),
         // i16 は最大値で割って正規化する。
-        SampleFormat::I16 => {
-            build_chunking_input_stream::<i16>(&device, &config, resampler, |sample| {
-                sample as f64 / i16::MAX as f64
-            })
-        }
+        SampleFormat::I16 => build_chunking_input_stream::<i16>(
+            &device,
+            &config,
+            resampler,
+            chunk_sender,
+            |sample| sample as f64 / i16::MAX as f64,
+        ),
         // u16 は中央値(32768)を 0 として正規化する。
-        SampleFormat::U16 => {
-            build_chunking_input_stream::<u16>(&device, &config, resampler, |sample| {
-                (sample as f64 - 32768.0) / 32768.0
-            })
-        }
+        SampleFormat::U16 => build_chunking_input_stream::<u16>(
+            &device,
+            &config,
+            resampler,
+            chunk_sender,
+            |sample| (sample as f64 - 32768.0) / 32768.0,
+        ),
         other => {
             return Err(format!(
                 "このデバイスのサンプル形式にはまだ対応していません: {other:?}"
@@ -284,11 +350,15 @@ fn open_loopback_stream() -> Result<cpal::Stream, String> {
 
 /// 実行中のキャプチャを制御するためのハンドル。
 ///
-/// - `stop_sender`: 専用スレッドへ停止を通知するための送信側。
-/// - `thread`: 専用スレッドの JoinHandle。Stop 時に join して Stream の drop 完了を待つ。
+/// - `stop_sender`: キャプチャ用スレッドへ停止を通知するための送信側。
+/// - `capture_thread`: Stream を所有するキャプチャ用スレッドの JoinHandle。
+///   Stop 時に join して Stream（＝チャンク送信側）の drop 完了を待つ。
+/// - `worker_thread`: チャンクを受信するワーカースレッドの JoinHandle。
+///   キャプチャ側 drop 後に送信側が切断されるので、その後 join して終了を待つ。
 struct CaptureHandle {
     stop_sender: mpsc::Sender<()>,
-    thread: thread::JoinHandle<()>,
+    capture_thread: thread::JoinHandle<()>,
+    worker_thread: thread::JoinHandle<()>,
 }
 
 /// Tauri State として保持するキャプチャ状態。
@@ -301,10 +371,18 @@ struct CaptureState {
 
 /// ループバックキャプチャを開始する。
 ///
-/// 専用スレッドを起動し、その中で Stream 生成と `play()` を行う。生成の成否は
-/// チャンネルで受け取り、`play()` まで成功して初めて `Ok(())` を返す
+/// Start ごとに以下をすべて新規作成し、前回の状態を持ち越さない:
+/// 新しい bounded channel、新しいワーカースレッド、新しい `AudioChunkBuffer`
+/// （Stream 構築時）、新しい `LinearResampler`。
+///
+/// キャプチャ用スレッドを起動し、その中で Stream 生成と `play()` を行う。生成の成否は
+/// setup チャンネルで受け取り、`play()` まで成功して初めて `Ok(())` を返す
 /// （成功前に React 側を Capturing 状態にしないため）。
 /// すでに実行中の場合は新しいスレッドを作らず、分かりやすいエラーを返す。
+///
+/// setup 失敗時は、キャプチャ用スレッド内で `chunk_sender` が drop されてワーカーが
+/// 切断を検知するため、キャプチャ用スレッドとワーカースレッドの両方を join して
+/// 中途半端なスレッドや State を残さない。
 #[tauri::command]
 fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
     let mut handle_guard = state
@@ -316,19 +394,27 @@ fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> 
         return Err("すでに音声キャプチャを実行中です。".to_string());
     }
 
+    // 有限容量の bounded channel。容量を超える完成チャンクはコールバック側で破棄する。
+    let (chunk_sender, chunk_receiver) = mpsc::sync_channel::<Vec<f32>>(AUDIO_CHUNK_QUEUE_CAPACITY);
+
+    // 受信専用のワーカースレッド。送信側（Stream 内）が drop されるまで動き続ける。
+    let worker_thread = spawn_audio_worker(chunk_receiver);
+
     let (stop_sender, stop_receiver) = mpsc::channel::<()>();
     let (setup_sender, setup_receiver) = mpsc::channel::<Result<(), String>>();
 
-    let thread = thread::spawn(move || match open_loopback_stream() {
+    let capture_thread = thread::spawn(move || match open_loopback_stream(chunk_sender) {
         Ok(stream) => {
             // 生成・再生成功を通知したうえで、停止通知が来るまで待機する。
             let _ = setup_sender.send(Ok(()));
             // recv() は () を受信するか、送信側が drop されると返る。どちらでも停止する。
             let _ = stop_receiver.recv();
             // ここで stream が drop され、キャプチャが停止する。
+            // 同時にコールバック内の chunk_sender も drop され、ワーカーが切断を検知する。
             drop(stream);
         }
         Err(message) => {
+            // 失敗時は chunk_sender がここで drop され、ワーカーが終了できる。
             let _ = setup_sender.send(Err(message));
         }
     });
@@ -338,17 +424,20 @@ fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> 
         Ok(Ok(())) => {
             *handle_guard = Some(CaptureHandle {
                 stop_sender,
-                thread,
+                capture_thread,
+                worker_thread,
             });
             Ok(())
         }
         Ok(Err(message)) => {
-            // 失敗時、専用スレッドはすでに終了しているので join で後始末する。
-            let _ = thread.join();
+            // 失敗時、キャプチャ用スレッドは終了済み。送信側 drop によりワーカーも終了する。
+            let _ = capture_thread.join();
+            let _ = worker_thread.join();
             Err(message)
         }
         Err(_) => {
-            let _ = thread.join();
+            let _ = capture_thread.join();
+            let _ = worker_thread.join();
             Err("音声キャプチャスレッドの起動に失敗しました。".to_string())
         }
     }
@@ -356,8 +445,14 @@ fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> 
 
 /// ループバックキャプチャを停止する。
 ///
-/// 実行中なら専用スレッドへ停止を通知し、join して Stream の drop 完了を待ってから
-/// 状態を空へ戻す（この後すぐ再 Start 可能）。未開始の場合は panic せず `Ok(())` を返す。
+/// 実行中なら以下の順で安全に終了させ、状態を空へ戻す（この後すぐ再 Start 可能）:
+/// 1. キャプチャ用スレッドへ停止通知を送る。
+/// 2. キャプチャ用スレッドを join する（内部で Stream を drop → コールボック内の
+///    chunk_sender も drop され、ワーカーの受信側が切断される）。
+/// 3. ワーカースレッドを join する（切断検知後、キュー内の残りチャンクを受信し終えて終了）。
+///
+/// この順序により「送信側が生きたままワーカーを先に join して永久待機」する
+/// デッドロックを避ける。未開始の場合は panic せず `Ok(())` を返す。
 #[tauri::command]
 fn stop_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
     // join 中はロックを保持しないよう、ハンドルを取り出してからロックを解放する。
@@ -372,7 +467,10 @@ fn stop_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
     match handle {
         Some(handle) => {
             let _ = handle.stop_sender.send(());
-            let _ = handle.thread.join();
+            // 先にキャプチャ用スレッドを join して送信側を確実に drop させる。
+            let _ = handle.capture_thread.join();
+            // その後ワーカーを join する。切断済みなので残りを処理して終了する。
+            let _ = handle.worker_thread.join();
             Ok(())
         }
         // 未開始でも安全に成功扱いにする（panic させない）。
