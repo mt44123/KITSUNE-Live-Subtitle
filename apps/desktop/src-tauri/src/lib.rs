@@ -1,9 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, StreamConfig};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use whisper_rs::{WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    install_logging_hooks, FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
+    WhisperState,
+};
 
 /// 出力オーディオデバイスを列挙し、既定の出力デバイス名をターミナルに表示する。
 ///
@@ -171,23 +174,130 @@ fn chunk_rms(samples: &[f32]) -> f64 {
 /// 保持する音声は「収集中の1チャンク + キュー内数チャンク + 処理中の1チャンク」に収まる。
 const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
 
-/// 受信した完成チャンクのサイズと RMS を表示するオーディオワーカースレッドを起動する。
+/// 1 チャンク（16kHz / mono / f32 / 16000 サンプル ≒ 1 秒）を Whisper で推論し、
+/// 認識テキストをコンソールへ出す。
 ///
-/// 目的は、将来の Whisper 推論をリアルタイムなオーディオコールバックの外で実行できる
-/// 構造を先に用意すること。今回はサイズと RMS のログ表示のみを行う。
+/// `state` はワーカーが所有し、チャンクごとに使い回す（毎チャンク作り直さない）。
+/// whisper.cpp の `whisper_full_with_state` は呼び出しごとに内部の推論結果を上書き
+/// するため、同じ `WhisperState` を連続して `full()` に渡して問題ない。各チャンクは
+/// 独立した約1秒の音声なので、直前チャンクの結果をプロンプトに引きずらないよう
+/// `set_no_context(true)` で毎回コンテキストをリセットする（rolling window ではない）。
+///
+/// `FullParams` は軽量なのでチャンクごとに新規生成する。入力 `samples` は借用のまま
+/// 渡し、`Vec<f32>` の clone や再変換は行わない。
+///
+/// 失敗（推論失敗 / segment 取得失敗）は panic せず、呼び出し側が 1 チャンク分だけ
+/// ログして次チャンクへ進めるよう、説明的な `Err(String)` を返す。
+fn transcribe_chunk(state: &mut WhisperState, samples: &[f32]) -> Result<(), String> {
+    // CPU 向け最小構成: greedy sampling（best_of = 1）。
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // 認識のみ。英語への翻訳はしない。
+    params.set_translate(false);
+    // 言語は自動判定（日本語・英語のどちらも壊さない）。
+    params.set_language(Some("auto"));
+    // 各チャンクを独立扱いにし、直前チャンクのテキストをプロンプトに使わない。
+    params.set_no_context(true);
+    // タイムスタンプは不要。
+    params.set_no_timestamps(true);
+    // whisper.cpp 内部のデバッグ / 進捗 / リアルタイム出力を抑制する。
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_print_special(false);
+
+    // 借用のまま渡す（clone しない）。full() 前の初期化は full() が内部で行う。
+    state
+        .full(params, samples)
+        .map_err(|error| format!("Failed to transcribe audio chunk: {error}"))?;
+
+    // 生成された全 segment のテキストを連結する。segment 数取得は c_int を直接返す
+    // （Result ではない）ため、ここで失敗する経路はない。
+    let segment_count = state.full_n_segments();
+    let mut text = String::new();
+    for index in 0..segment_count {
+        let segment = state.get_segment(index).ok_or_else(|| {
+            format!("Failed to read Whisper segment: index {index} out of bounds")
+        })?;
+        // 不正な UTF-8 は置換文字へ（日本語で途中バイトが来ても落とさない）。
+        let segment_text = segment
+            .to_str_lossy()
+            .map_err(|error| format!("Failed to read Whisper segment: {error}"))?;
+        text.push_str(&segment_text);
+    }
+
+    // 前後の空白を整理する。無音・空白のみのとき、および whisper.cpp が無音に対して
+    // 返す特殊マーカー "[BLANK_AUDIO]" に完全一致するときは、不要ログを避けるため
+    // 何も出さない。完全一致のみで判定し、部分一致で通常文章を消さない
+    // （大文字小文字も区別する）。正常な英語・日本語の認識結果はそのまま残る。
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "[BLANK_AUDIO]" {
+        return Ok(());
+    }
+    println!("Whisper transcription: {trimmed}");
+    Ok(())
+}
+
+/// 受信した完成チャンクのサイズ・RMS をログし、Whisper モデルが利用可能なら推論して
+/// 認識テキストを表示するオーディオワーカースレッドを起動する。
+///
+/// Whisper 推論は必ずこのワーカー側で実行し、リアルタイムな cpal コールバックでは
+/// 行わない。`whisper_context` は Start 時に State から clone した `Arc` を受け取る
+/// （`None` ならモデル未読み込み）。推論用 `WhisperState` はワーカー開始時に一度だけ
+/// `create_state()` で作り、以後のチャンクで使い回す。
+///
+/// モデル未読み込み、または state 作成失敗のときは、開始時に 1 回だけ分かりやすい
+/// ログを出して推論を無効化し、以降は従来どおりサイズ・RMS ログのみを続ける
+/// （毎チャンク同じ警告は出さない）。1 チャンクの推論エラーではワーカー全体を落とさず、
+/// そのチャンクだけログして次へ進む。
 ///
 /// `receiver.iter()` は送信側（コールバック内の `SyncSender`）が drop されるまで
 /// チャンクを1つずつ返し、drop（切断）後はキュー内の残りを受信し終えてから終了する
-/// （推奨A: 停止時にキュー内の完成チャンクを取りこぼさない）。
-fn spawn_audio_worker(chunk_receiver: mpsc::Receiver<Vec<f32>>) -> thread::JoinHandle<()> {
+/// （推奨A: 停止時にキュー内の完成チャンクを取りこぼさない）。Stop 時に推論中でも、
+/// 現在のチャンク推論が終わってから次の受信で切断を検知して抜けるため、join は
+/// 有限時間で完了する。
+fn spawn_audio_worker(
+    chunk_receiver: mpsc::Receiver<Vec<f32>>,
+    whisper_context: Option<Arc<WhisperContext>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         println!("Audio worker started");
+
+        // 推論用 state はワーカー開始時に1回だけ作成し、以後再利用する。
+        // context（Arc）はこのスレッドが所有し続けることで、state が参照する
+        // 下層 whisper_context の生存を保証する。
+        let mut whisper_state = match &whisper_context {
+            Some(context) => match context.create_state() {
+                Ok(state) => {
+                    println!("Whisper transcription enabled");
+                    Some(state)
+                }
+                // state 作成に失敗しても panic せず、推論だけ無効化して続行する。
+                Err(error) => {
+                    eprintln!("Failed to create Whisper state: {error}");
+                    eprintln!("Whisper transcription disabled");
+                    None
+                }
+            },
+            None => {
+                // モデル未読み込み。警告は開始時の1回だけ（毎チャンクは出さない）。
+                println!("Whisper model is not loaded; transcription disabled");
+                None
+            }
+        };
+
         // 送信側が生存する限りブロックして待ち、切断後は残りを受信して抜ける。
         for chunk in chunk_receiver.iter() {
             // RMS 計算はコールバック外（ワーカー側）で行い、リアルタイム性を確保する。
             let rms = chunk_rms(&chunk);
             println!("Worker received audio chunk: {} samples", chunk.len());
             println!("Worker chunk RMS: {rms:.6}");
+
+            // モデルが利用可能なチャンクだけ推論する。エラーは1チャンク分ログして継続。
+            if let Some(state) = whisper_state.as_mut() {
+                if let Err(error) = transcribe_chunk(state, &chunk) {
+                    eprintln!("{error}");
+                }
+            }
         }
         println!("Audio worker stopped");
     })
@@ -386,7 +496,10 @@ struct CaptureState {
 /// 切断を検知するため、キャプチャ用スレッドとワーカースレッドの両方を join して
 /// 中途半端なスレッドや State を残さない。
 #[tauri::command]
-fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> {
+fn start_audio_capture(
+    state: tauri::State<CaptureState>,
+    whisper_state: tauri::State<WhisperModelState>,
+) -> Result<(), String> {
     let mut handle_guard = state
         .handle
         .lock()
@@ -396,11 +509,24 @@ fn start_audio_capture(state: tauri::State<CaptureState>) -> Result<(), String> 
         return Err("すでに音声キャプチャを実行中です。".to_string());
     }
 
+    // Start 時点でモデルが読み込み済みなら、State から Arc<WhisperContext> だけを
+    // clone する（モデル本体は複製せず参照カウントを +1 するだけ）。ここで Whisper
+    // State の Mutex は即座に解放し、以降の推論中は保持しない。モデルのロードと
+    // Start が競合しても、この短時間ロックは panic せず安全に処理される。
+    // まだ読み込まれていなければ None を渡し、ワーカーは推論を無効化する。
+    let whisper_context: Option<Arc<WhisperContext>> = {
+        let guard = whisper_state
+            .context
+            .lock()
+            .map_err(|_| "Whisper モデルの内部状態のロックに失敗しました。".to_string())?;
+        guard.clone()
+    };
+
     // 有限容量の bounded channel。容量を超える完成チャンクはコールバック側で破棄する。
     let (chunk_sender, chunk_receiver) = mpsc::sync_channel::<Vec<f32>>(AUDIO_CHUNK_QUEUE_CAPACITY);
 
     // 受信専用のワーカースレッド。送信側（Stream 内）が drop されるまで動き続ける。
-    let worker_thread = spawn_audio_worker(chunk_receiver);
+    let worker_thread = spawn_audio_worker(chunk_receiver, whisper_context);
 
     let (stop_sender, stop_receiver) = mpsc::channel::<()>();
     let (setup_sender, setup_receiver) = mpsc::channel::<Result<(), String>>();
@@ -510,15 +636,18 @@ fn resolve_whisper_model_path() -> PathBuf {
 
 /// Tauri State として保持する Whisper モデルの状態。
 ///
-/// 読み込み済みの `WhisperContext` を `Mutex<Option<...>>` で保持し、コマンド呼び出し
-/// ごとの再読み込みを防ぐ（`None` なら未読み込み、`Some` なら読み込み済み）。
+/// 読み込み済みの `WhisperContext` を `Arc` で包み、`Mutex<Option<...>>` で保持する
+/// （`None` なら未読み込み、`Some` なら読み込み済み）。`Arc` にすることで、Start 時に
+/// State のロックを短時間だけ取って `Arc` の複製（＝参照カウント +1、モデル本体は複製
+/// しない）を取り出し、以降はロックを解放したままワーカースレッドが Whisper context を
+/// 利用できる。推論中に State の Mutex を保持し続けない設計にするための包み方。
 ///
 /// `WhisperContext` は whisper-rs 側でスレッド安全に実装されている（`Send` + `Sync`）
 /// ため、この crate 側で `unsafe impl Send/Sync` や `static mut`、生ポインタ共有を
 /// 使わずに、そのまま Tauri State（内部で `Send + Sync` を要求）へ安全に保持できる。
 #[derive(Default)]
 struct WhisperModelState {
-    context: Mutex<Option<WhisperContext>>,
+    context: Mutex<Option<Arc<WhisperContext>>>,
 }
 
 /// 手動配置された Whisper モデルを読み込み、Tauri State へ保存する。
@@ -576,12 +705,21 @@ async fn load_whisper_model(state: tauri::State<'_, WhisperModelState>) -> Resul
     if guard.is_some() {
         return Ok("Whisper model is already loaded".to_string());
     }
-    *guard = Some(context);
+    // Arc で包んで保持する。以後 Start 時はこの Arc を clone して共有する。
+    *guard = Some(Arc::new(context));
     Ok("Whisper model loaded successfully".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // whisper.cpp / GGML の内部ログ（whisper_full_with_state: ... や seek = ... など）を
+    // whisper-rs の安全な公開 API で抑制する。log_backend / tracing_backend feature を
+    // 有効化していないため、これらのログはどこにも出力されなくなる（実質的に無効化）。
+    // アプリ側で明示的に出す println!/eprintln!（RMS・認識結果・エラー等）は影響を受けない。
+    // この関数は「複数回呼んでも安全・効果は初回のみ」だが、意図を明確にするため
+    // アプリ起動時にここで一度だけ呼ぶ。unsafe な set_log_callback や独自 C callback は使わない。
+    install_logging_hooks();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(CaptureState::default())
