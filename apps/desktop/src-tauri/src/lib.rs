@@ -197,6 +197,87 @@ struct TranscriptionPayload {
 /// 保持する音声は「収集中の1チャンク + キュー内数チャンク + 処理中の1チャンク」に収まる。
 const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
 
+/// 単語比較で「末尾を無視してよい」とみなす文字（空白と、文境界で揺れやすい句読点
+/// `. , ! ? : ;` だけ）。
+///
+/// Rolling window では同じ発話が毎秒少しずつ伸び、句読点だけが揺れることがある
+/// （例: "you" ↔ "you."）。単語末尾でこれらを無視することで、句読点のずれに強い
+/// 重複判定にする。引用符・括弧・アポストロフィー・`$`・`#`・`+`・`-` などは意味の
+/// ある記号（"Hello" / $500 / #1 / +10 など）を壊さないよう、境界文字に含めない。
+fn is_boundary_char(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ':' | ';')
+}
+
+/// 単語比較用に 1 語を正規化する。小文字化し、末尾の文境界句読点だけを落とす。
+///
+/// 比較時のみ使う正規化で、React へ返すテキストには使わない（返却は current の元表記）。
+/// 末尾の `. , ! ? : ;` のみ除去し、引用符・アポストロフィー・`$`・`#`・`+`・`-` などは残す。
+fn normalize_word(word: &str) -> String {
+    word.trim_end_matches(is_boundary_char).to_lowercase()
+}
+
+/// Sliding window で 3 語以上の重複を「意味のある重複」とみなす最小語数。
+///
+/// 1〜2 語だけの一致は偶然一致の可能性が高いため、重複として採用せず全文を送る。
+const MIN_OVERLAP_WORDS: usize = 3;
+
+/// 前回の Whisper 認識全文 `previous` と最新の認識全文 `current` を比較し、React へ
+/// 新しく送るべき差分テキストを決める。翻訳・履歴・UI には一切関与しない純粋関数。
+///
+/// Rolling window は約5秒で満杯になり、その後は先頭の古い音声が消えて末尾に新しい音声が
+/// 加わる。このため `current` は `previous` の「前方一致」ではなく「末尾と先頭が重なる
+/// Sliding window」になる。そこで単語単位で「`previous` の末尾 k 語」と「`current` の
+/// 先頭 k 語」が一致する最長の k を探し、重複後の新しい語だけを返す（前方一致は k =
+/// previous の語数となる特殊形として同じ判定で扱える）。
+///
+/// - 完全一致（大文字小文字・末尾句読点を無視）なら `None`（emit しない）。
+/// - `MIN_OVERLAP_WORDS` 語以上の重複があれば、重複後の新しい語だけを返す。
+/// - 有効な重複が無い（初回・重複なし・1〜2 語だけの偶然一致）なら `current` 全文を返す。
+///
+/// 比較は小文字化と各単語末尾の `. , ! ? : ;` を無視して行うが、返すテキストは常に
+/// `current` の元の表記（大文字・句読点・記号）をそのまま保持する。
+fn incremental_transcription(previous: &str, current: &str) -> Option<String> {
+    // 表示は current の元表記を使う。空白区切りの語に分割する。
+    let current_words: Vec<&str> = current.split_whitespace().collect();
+    if current_words.is_empty() {
+        return None;
+    }
+    let previous_words: Vec<&str> = previous.split_whitespace().collect();
+
+    // 比較用に正規化した語列（小文字化＋末尾句読点除去）。
+    let previous_norm: Vec<String> = previous_words.iter().map(|w| normalize_word(w)).collect();
+    let current_norm: Vec<String> = current_words.iter().map(|w| normalize_word(w)).collect();
+
+    // 1. 完全一致（大文字小文字・末尾句読点を無視）なら送らない。
+    if previous_norm == current_norm {
+        return None;
+    }
+
+    // 2/3. previous の末尾 k 語と current の先頭 k 語が一致する最長の k を探す。
+    //      前方一致（current が previous から伸びる）も k = previous の語数となる特殊形。
+    let max_overlap = previous_norm.len().min(current_norm.len());
+    let mut overlap = 0usize;
+    for k in (1..=max_overlap).rev() {
+        if previous_norm[previous_norm.len() - k..] == current_norm[..k] {
+            overlap = k;
+            break;
+        }
+    }
+
+    // 4/6. 3 語以上の重複だけを採用する。初回・重複なし・1〜2 語の偶然一致では全文を送る。
+    if overlap < MIN_OVERLAP_WORDS {
+        return Some(current.to_string());
+    }
+
+    // 重複後の新しい語だけを、current の元表記のまま返す。新しい語が無ければ送らない。
+    let new_words = &current_words[overlap..];
+    if new_words.is_empty() {
+        None
+    } else {
+        Some(new_words.join(" "))
+    }
+}
+
 /// Rolling window（16kHz / mono / f32 / 最大 WHISPER_WINDOW_SAMPLES ≒ 5 秒）を
 /// Whisper で推論し、認識テキストをコンソールへ出す。
 ///
@@ -213,13 +294,17 @@ const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
 /// 失敗（推論失敗 / segment 取得失敗）は panic せず、呼び出し側が 1 チャンク分だけ
 /// ログして次チャンクへ進めるよう、説明的な `Err(String)` を返す。
 ///
-/// 認識に成功して意味のあるテキストが得られたときは、従来どおりコンソールへ出力した
-/// うえで、`app` を通じて Tauri イベント（`TRANSCRIPTION_EVENT`）を emit し、React 側へ
-/// 最新テキストを届ける。emit の失敗はワーカーを止めず、1 回分だけログして継続する。
+/// 認識に成功して意味のあるテキストが得られたときは、従来どおり全文をコンソールへ出力する。
+/// React 側へは全文ではなく、`previous_transcription`（前回の Whisper 認識全文）との差分だけを
+/// `incremental_transcription` で求めて emit する。Rolling window では毎秒ほぼ同じ文章が返る
+/// ため、増えた部分だけを送って重複表示を避ける。判定後は `previous_transcription` を最新全文へ
+/// 更新する（完全一致で emit しない場合も更新する）。emit の失敗はワーカーを止めず、1 回分だけ
+/// ログして継続する。
 fn transcribe_chunk(
     app: &AppHandle,
     state: &mut WhisperState,
     samples: &[f32],
+    previous_transcription: &mut String,
 ) -> Result<(), String> {
     // CPU 向け最小構成: greedy sampling（best_of = 1）。
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -266,17 +351,23 @@ fn transcribe_chunk(
     if trimmed.is_empty() || trimmed == "[BLANK_AUDIO]" {
         return Ok(());
     }
+    // コンソールには従来どおり「全文」を出す（差分化は React へ送る内容だけに適用する）。
     println!("Whisper transcription: {trimmed}");
 
-    // 意味のあるテキストのみを最新字幕として React 側へ届ける。emit 失敗でワーカー全体は
-    // 落とさず、そのチャンク分だけログして次へ進む（推論と同じエラー方針に揃える）。
-    if let Err(error) = app.emit(
-        TRANSCRIPTION_EVENT,
-        TranscriptionPayload {
-            text: trimmed.to_string(),
-        },
-    ) {
-        eprintln!("Failed to emit transcription event: {error}");
+    // 前回の Whisper 認識全文との差分を求め、React へは増えた部分だけを送る。
+    // 判定は更新前の previous を使い、判定後に previous を最新全文へ更新する。
+    let diff = incremental_transcription(previous_transcription, trimmed);
+    *previous_transcription = trimmed.to_string();
+
+    // 差分があるときだけ最新字幕として React 側へ届ける（完全一致なら emit しない）。emit 失敗で
+    // ワーカー全体は落とさず、そのチャンク分だけログして次へ進む（推論と同じエラー方針に揃える）。
+    if let Some(text_to_emit) = diff {
+        if let Err(error) = app.emit(
+            TRANSCRIPTION_EVENT,
+            TranscriptionPayload { text: text_to_emit },
+        ) {
+            eprintln!("Failed to emit transcription event: {error}");
+        }
     }
     Ok(())
 }
@@ -340,6 +431,11 @@ fn spawn_audio_worker(
         // 再 Start では新しいワーカーが空の状態から作り直す。
         let mut rolling_samples: Vec<f32> = Vec::with_capacity(WHISPER_WINDOW_SAMPLES);
 
+        // 前回の Whisper 認識全文。差分抽出の基準に使う。ワーカースレッドのローカル変数
+        // としてだけ保持し、グローバル State には保存しない。Stop でワーカーが終了すると
+        // drop され、再 Start では新しいワーカーが空文字から始めるため自然にリセットされる。
+        let mut previous_transcription = String::new();
+
         // 送信側が生存する限りブロックして待ち、切断後は残りを受信して抜ける。
         for chunk in chunk_receiver.iter() {
             // RMS 計算はコールバック外（ワーカー側）で行い、リアルタイム性を確保する。
@@ -367,7 +463,12 @@ fn spawn_audio_worker(
                     window_seconds
                 );
                 // rolling window 全体を借用のまま渡す（1秒チャンク単体ではない / clone しない）。
-                if let Err(error) = transcribe_chunk(&app, state, rolling_samples.as_slice()) {
+                if let Err(error) = transcribe_chunk(
+                    &app,
+                    state,
+                    rolling_samples.as_slice(),
+                    &mut previous_transcription,
+                ) {
                     eprintln!("{error}");
                 }
             }
@@ -808,4 +909,90 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::incremental_transcription;
+
+    /// 1. 初回（previous が空）は current 全文を返す。
+    #[test]
+    fn first_transcription_returns_full_text() {
+        assert_eq!(
+            incremental_transcription("", "Hello world how are you"),
+            Some("Hello world how are you".to_string())
+        );
+    }
+
+    /// 2. 完全一致は None（大文字小文字・末尾句読点の差も完全一致として吸収）。
+    #[test]
+    fn exact_match_returns_none() {
+        assert_eq!(
+            incremental_transcription("I need water.", "I need water."),
+            None
+        );
+        assert_eq!(
+            incremental_transcription("I need water.", "i need water"),
+            None
+        );
+    }
+
+    /// 3. 全文が伸びた前方一致では増分だけを返す。
+    #[test]
+    fn prefix_growth_returns_increment_only() {
+        assert_eq!(
+            incremental_transcription("We'll tell you.", "We'll tell you what to do."),
+            Some("what to do.".to_string())
+        );
+    }
+
+    /// 4. previous の末尾と current の先頭が 3 語以上重なるときは増分だけを返す。
+    #[test]
+    fn sliding_window_overlap_returns_increment_only() {
+        let previous = "statement of this first round. It doesn't get less close. Yeah, you mean";
+        let current = "first round. It doesn't get less close. Yeah, you mean it doesn't.";
+        assert_eq!(
+            incremental_transcription(previous, current),
+            Some("it doesn't.".to_string())
+        );
+    }
+
+    /// 5. 1〜2 語だけの一致は偶然一致とみなし、current 全文を返す。
+    #[test]
+    fn short_overlap_returns_full_text() {
+        let previous = "alpha beta gamma you mean";
+        let current = "you mean something entirely new";
+        assert_eq!(
+            incremental_transcription(previous, current),
+            Some(current.to_string())
+        );
+    }
+
+    /// 6. 重複がまったく無いときは current 全文を返す。
+    #[test]
+    fn no_overlap_returns_full_text() {
+        let current = "nothing in common today";
+        assert_eq!(
+            incremental_transcription("completely different words here", current),
+            Some(current.to_string())
+        );
+    }
+
+    /// 7. 比較時は大文字小文字と末尾句読点の違いを吸収する（返却は元表記）。
+    #[test]
+    fn comparison_ignores_case_and_trailing_punctuation() {
+        assert_eq!(
+            incremental_transcription("Hello there World.", "hello there world! Indeed"),
+            Some("Indeed".to_string())
+        );
+    }
+
+    /// 8. 返すテキストは current の元表記を維持する（引用符・$・#・+ を削除しない）。
+    #[test]
+    fn increment_preserves_original_current_representation() {
+        assert_eq!(
+            incremental_transcription("the price is", "the price is \"$500\" +10 #1"),
+            Some("\"$500\" +10 #1".to_string())
+        );
+    }
 }
