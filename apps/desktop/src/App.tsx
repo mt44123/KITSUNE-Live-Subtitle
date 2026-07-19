@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
 
 // Phase 2: Rust コマンドを呼び出す。
@@ -9,6 +10,14 @@ import "./App.css";
 
 const INPUT_LANGUAGES = ["Auto Detect", "English", "Japanese", "Korean"];
 const TARGET_LANGUAGES = ["Japanese", "English", "Korean"];
+
+// Rust 側が認識テキストを届ける Tauri イベント名。Rust の TRANSCRIPTION_EVENT と一致させる。
+const TRANSCRIPTION_EVENT = "transcription";
+
+// 認識テキストのイベントペイロード。Rust の TranscriptionPayload と同じ形（text のみ）。
+type TranscriptionPayload = {
+  text: string;
+};
 
 // キャプチャの状態。idle=未開始, starting=開始処理中, capturing=取得中, stopping=停止処理中。
 type CaptureStatus = "idle" | "starting" | "capturing" | "stopping";
@@ -43,6 +52,32 @@ function App() {
   const [whisperStatus, setWhisperStatus] = useState<WhisperStatus>("unloaded");
   const [whisperMessage, setWhisperMessage] = useState<string | null>(null);
   const [whisperError, setWhisperError] = useState<string | null>(null);
+
+  // 最新の認識テキストのみを保持する（履歴なし）。次のイベントで置き換える。
+  const [transcription, setTranscription] = useState("");
+
+  // Rust からの transcription イベントを購読し、最新テキストで置き換える。
+  // listen は Promise<UnlistenFn> を返すため、購読解除関数を受け取り、アンマウント時に
+  // 呼んでリスナーを確実に解除する。解除前に完了しても取りこぼさないようフラグで制御する。
+  useEffect(() => {
+    let isMounted = true;
+    let unlisten: UnlistenFn | undefined;
+
+    listen<TranscriptionPayload>(TRANSCRIPTION_EVENT, (event) => {
+      setTranscription(event.payload.text);
+    }).then((unlistenFn) => {
+      if (isMounted) {
+        unlisten = unlistenFn;
+      } else {
+        unlistenFn();
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      unlisten?.();
+    };
+  }, []);
 
   const startCapture = async () => {
     setCaptureError(null);
@@ -227,6 +262,11 @@ function App() {
             ))}
           </select>
         </label>
+      </section>
+
+      <section className="panel">
+        <h2 className="panel-title">Live Transcription</h2>
+        <p className="subtitle-original">{transcription}</p>
       </section>
 
       <section className="panel subtitle-preview">

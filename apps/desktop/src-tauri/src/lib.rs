@@ -3,6 +3,7 @@ use cpal::{SampleFormat, SizedSample, StreamConfig};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use tauri::{AppHandle, Emitter};
 use whisper_rs::{
     install_logging_hooks, FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
     WhisperState,
@@ -168,6 +169,22 @@ fn chunk_rms(samples: &[f32]) -> f64 {
     (sum_of_squares / samples.len() as f64).sqrt()
 }
 
+/// フロントエンドへ認識テキストを届ける Tauri イベント名。
+///
+/// React 側はこの名前を `listen` で購読し、`payload.text` を表示する。名前は Rust と
+/// React で一致させる必要があるため、変更する場合は両方を同時に更新すること。
+const TRANSCRIPTION_EVENT: &str = "transcription";
+
+/// Tauri イベントで送る認識テキストのペイロード。
+///
+/// フロントエンドが期待する形（`{ "text": "..." }`）に合わせて `text` フィールドのみを
+/// 持つ。`emit` はペイロードに `Clone + Serialize` を要求するため両方を導出する。
+/// 空文字や `[BLANK_AUDIO]` はここへ来る前に除外済みなので、常に意味のある文字列が入る。
+#[derive(Clone, serde::Serialize)]
+struct TranscriptionPayload {
+    text: String,
+}
+
 /// オーディオコールバックからワーカーへ完成チャンクを渡す bounded channel の容量。
 ///
 /// 有限容量にすることで、将来 Whisper 推論が入力より遅れてもキューが無制限に伸びず、
@@ -188,7 +205,15 @@ const AUDIO_CHUNK_QUEUE_CAPACITY: usize = 2;
 ///
 /// 失敗（推論失敗 / segment 取得失敗）は panic せず、呼び出し側が 1 チャンク分だけ
 /// ログして次チャンクへ進めるよう、説明的な `Err(String)` を返す。
-fn transcribe_chunk(state: &mut WhisperState, samples: &[f32]) -> Result<(), String> {
+///
+/// 認識に成功して意味のあるテキストが得られたときは、従来どおりコンソールへ出力した
+/// うえで、`app` を通じて Tauri イベント（`TRANSCRIPTION_EVENT`）を emit し、React 側へ
+/// 最新テキストを届ける。emit の失敗はワーカーを止めず、1 回分だけログして継続する。
+fn transcribe_chunk(
+    app: &AppHandle,
+    state: &mut WhisperState,
+    samples: &[f32],
+) -> Result<(), String> {
     // CPU 向け最小構成: greedy sampling（best_of = 1）。
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     // 認識のみ。英語への翻訳はしない。
@@ -234,6 +259,17 @@ fn transcribe_chunk(state: &mut WhisperState, samples: &[f32]) -> Result<(), Str
         return Ok(());
     }
     println!("Whisper transcription: {trimmed}");
+
+    // 意味のあるテキストのみを最新字幕として React 側へ届ける。emit 失敗でワーカー全体は
+    // 落とさず、そのチャンク分だけログして次へ進む（推論と同じエラー方針に揃える）。
+    if let Err(error) = app.emit(
+        TRANSCRIPTION_EVENT,
+        TranscriptionPayload {
+            text: trimmed.to_string(),
+        },
+    ) {
+        eprintln!("Failed to emit transcription event: {error}");
+    }
     Ok(())
 }
 
@@ -256,6 +292,7 @@ fn transcribe_chunk(state: &mut WhisperState, samples: &[f32]) -> Result<(), Str
 /// 現在のチャンク推論が終わってから次の受信で切断を検知して抜けるため、join は
 /// 有限時間で完了する。
 fn spawn_audio_worker(
+    app: AppHandle,
     chunk_receiver: mpsc::Receiver<Vec<f32>>,
     whisper_context: Option<Arc<WhisperContext>>,
 ) -> thread::JoinHandle<()> {
@@ -294,7 +331,7 @@ fn spawn_audio_worker(
 
             // モデルが利用可能なチャンクだけ推論する。エラーは1チャンク分ログして継続。
             if let Some(state) = whisper_state.as_mut() {
-                if let Err(error) = transcribe_chunk(state, &chunk) {
+                if let Err(error) = transcribe_chunk(&app, state, &chunk) {
                     eprintln!("{error}");
                 }
             }
@@ -497,6 +534,7 @@ struct CaptureState {
 /// 中途半端なスレッドや State を残さない。
 #[tauri::command]
 fn start_audio_capture(
+    app: AppHandle,
     state: tauri::State<CaptureState>,
     whisper_state: tauri::State<WhisperModelState>,
 ) -> Result<(), String> {
@@ -526,7 +564,9 @@ fn start_audio_capture(
     let (chunk_sender, chunk_receiver) = mpsc::sync_channel::<Vec<f32>>(AUDIO_CHUNK_QUEUE_CAPACITY);
 
     // 受信専用のワーカースレッド。送信側（Stream 内）が drop されるまで動き続ける。
-    let worker_thread = spawn_audio_worker(chunk_receiver, whisper_context);
+    // ワーカーはコマンドより長生きするため、'static な AppHandle を渡す
+    // （emit で最新字幕イベントを送るために必要）。
+    let worker_thread = spawn_audio_worker(app, chunk_receiver, whisper_context);
 
     let (stop_sender, stop_receiver) = mpsc::channel::<()>();
     let (setup_sender, setup_receiver) = mpsc::channel::<Result<(), String>>();
