@@ -61,26 +61,44 @@ fn list_audio_devices() -> Result<Vec<String>, String> {
 
 /// ループバック用の入力ストリームを構築する。
 ///
-/// コールバックでは受け取ったサンプル数を数え、約1秒ごとに合計を表示する。
+/// コールバックでは受け取ったサンプル数を数え、あわせて音量(RMS)を集計し、
+/// 約1秒ごとに `Received samples: N | RMS: x.xxxxxx` の形式で表示する。
 /// （毎コールバックで表示すると大量に出力されるため、1秒間隔にまとめている。）
-/// サンプル形式（f32 / i16 / u16）ごとに同じ処理を使い回すためジェネリックにしている。
+///
+/// サンプル形式(f32 / i16 / u16)ごとに同じ処理を使い回すためジェネリックにし、
+/// 各形式を概ね -1.0〜1.0 に正規化する関数 `normalize` を引数で受け取る。
 fn build_counting_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
+    normalize: fn(T) -> f64,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
-    T: SizedSample,
+    T: SizedSample + 'static,
 {
     let mut sample_count: usize = 0;
+    let mut sum_of_squares: f64 = 0.0;
     let mut last_report = Instant::now();
 
     device.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _info| {
             sample_count += data.len();
+            for &sample in data {
+                let value = normalize(sample);
+                sum_of_squares += value * value;
+            }
+
             if last_report.elapsed() >= Duration::from_secs(1) {
-                println!("Received samples: {sample_count}");
+                // RMS = sqrt(二乗和 / サンプル数)。サンプルが無い場合は 0 とする。
+                let rms = if sample_count > 0 {
+                    (sum_of_squares / sample_count as f64).sqrt()
+                } else {
+                    0.0
+                };
+                println!("Received samples: {sample_count} | RMS: {rms:.6}");
+
                 sample_count = 0;
+                sum_of_squares = 0.0;
                 last_report = Instant::now();
             }
         },
@@ -118,9 +136,18 @@ fn start_audio_capture() -> Result<(), String> {
             let config: StreamConfig = default_config.config();
 
             let stream = match sample_format {
-                SampleFormat::F32 => build_counting_input_stream::<f32>(&device, &config),
-                SampleFormat::I16 => build_counting_input_stream::<i16>(&device, &config),
-                SampleFormat::U16 => build_counting_input_stream::<u16>(&device, &config),
+                // f32 はそのまま(概ね -1.0〜1.0)。
+                SampleFormat::F32 => {
+                    build_counting_input_stream::<f32>(&device, &config, |sample| sample as f64)
+                }
+                // i16 は最大値で割って正規化する。
+                SampleFormat::I16 => build_counting_input_stream::<i16>(&device, &config, |sample| {
+                    sample as f64 / i16::MAX as f64
+                }),
+                // u16 は中央値(32768)を 0 として正規化する。
+                SampleFormat::U16 => build_counting_input_stream::<u16>(&device, &config, |sample| {
+                    (sample as f64 - 32768.0) / 32768.0
+                }),
                 other => {
                     return Err(format!(
                         "このデバイスのサンプル形式にはまだ対応していません: {other:?}"
