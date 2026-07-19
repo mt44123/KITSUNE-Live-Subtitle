@@ -114,46 +114,82 @@ impl LinearResampler {
     }
 }
 
-/// ループバック用の入力ストリームを構築する（Whisper 前処理: モノラル化 + 16kHz リサンプリング検証）。
+/// Whisper へ渡す 1 チャンクのサンプル数（16kHz モノラルで約1秒分）。
+const CHUNK_SIZE: usize = 16_000;
+
+/// 16kHz モノラルサンプルを固定長（CHUNK_SIZE）まで貯めるバッファ。
+///
+/// `push` で 1 サンプルずつ追加し、CHUNK_SIZE 揃ったら `Vec<f32>` を返す。
+/// 収集中は最大でも CHUNK_SIZE 個しか保持しないため、メモリは増え続けない。
+struct AudioChunkBuffer {
+    samples: Vec<f32>,
+}
+
+impl AudioChunkBuffer {
+    fn new() -> Self {
+        Self {
+            samples: Vec::with_capacity(CHUNK_SIZE),
+        }
+    }
+
+    /// サンプルを 1 つ追加する。CHUNK_SIZE 揃ったら完成チャンクを返し、収集を新しく始める。
+    ///
+    /// 完成時は `std::mem::take` で内部 Vec の所有権を呼び出し元へ移す（clone しない）。
+    /// take 後は空の Vec になるため、次チャンク用に容量を確保し直す。
+    fn push(&mut self, sample: f32) -> Option<Vec<f32>> {
+        self.samples.push(sample);
+        if self.samples.len() >= CHUNK_SIZE {
+            let chunk = std::mem::take(&mut self.samples);
+            self.samples = Vec::with_capacity(CHUNK_SIZE);
+            Some(chunk)
+        } else {
+            None
+        }
+    }
+}
+
+/// 完成した 16kHz チャンクの RMS を計算する。チャンク完成時だけ呼ぶ。
+fn chunk_rms(samples: &[f32]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_of_squares: f64 = samples
+        .iter()
+        .map(|&sample| {
+            let value = sample as f64;
+            value * value
+        })
+        .sum();
+    (sum_of_squares / samples.len() as f64).sqrt()
+}
+
+/// ループバック用の入力ストリームを構築する（Whisper 前処理: モノラル化 + 16kHz + 固定長チャンク化）。
 ///
 /// コールバックでは、インターリーブ入力をフレーム単位（1フレーム = 全チャンネル）でモノラル化し、
-/// それを線形補間リサンプラーへ順番に渡して 16kHz へ変換、変換後サンプルの RMS を集計する。
-/// 約1秒分（変換後 16000 サンプル）貯まるたびに設定と集計結果を表示し、集計値だけをリセットする
-/// （リサンプラーの位相・前回サンプルなどの連続状態はリセットしない）。
+/// 線形補間リサンプラーで 16kHz へ変換したサンプルを `AudioChunkBuffer` へ順番に push する。
+/// CHUNK_SIZE(16000) 揃うたびに `Vec<f32>` を取り出して RMS を表示する（チャンク自体は保持しない）。
 ///
 /// サンプル形式(f32 / i16 / u16)ごとに同じ処理を使い回すためジェネリックにし、
 /// 各形式を概ね -1.0〜1.0 に正規化する関数 `normalize` を引数で受け取る。
-/// チャンネル数・サンプルレート・形式は固定せず、実際の StreamConfig から受け取る。
-fn build_mono_monitoring_stream<T>(
+/// チャンネル数・サンプルレートは固定せず、実際の StreamConfig から受け取る。
+fn build_chunking_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    sample_format: SampleFormat,
     mut resampler: LinearResampler,
-    output_rate: u32,
     normalize: fn(T) -> f64,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + 'static,
 {
-    // 実際のデバイス設定から取得する（48kHz/2ch を固定しない）。
     // チャンネル数が 0 でも chunks_exact(0) で panic しないよう最低 1 とする。
     let channels = config.channels.max(1) as usize;
-    let input_rate = (config.sample_rate as usize).max(1);
-    let format_label = format!("{sample_format:?}");
-    // 表示判定は変換後サンプル数を基準にする。
-    let report_threshold = (output_rate as usize).max(1);
 
-    // ログ集計値。ストリーム生成のたびに新規初期化され、再 Start で持ち越さない。
-    let mut input_sample_count: usize = 0;
-    let mut mono_sample_count: usize = 0;
-    let mut resampled_sample_count: usize = 0;
-    let mut resampled_sum_of_squares: f64 = 0.0;
+    // 収集中のチャンクバッファ。ストリーム生成のたびに新規作成され、再 Start で持ち越さない。
+    let mut chunk_buffer = AudioChunkBuffer::new();
 
     device.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _info| {
-            input_sample_count += data.len();
-
             // 1フレーム = channels 個。末尾の不完全フレームは chunks_exact が無視する。
             for frame in data.chunks_exact(channels) {
                 let mut frame_sum = 0.0f64;
@@ -162,32 +198,17 @@ where
                     frame_sum += normalize(sample).clamp(-1.0, 1.0);
                 }
                 let mono = frame_sum / channels as f64;
-                mono_sample_count += 1;
 
-                // モノラルサンプルを 16kHz へ変換し、変換後サンプルだけを集計する。
+                // モノラルサンプルを 16kHz へ変換し、チャンクへ push する。
                 resampler.process_sample(mono, |resampled| {
-                    let value = resampled as f64;
-                    resampled_sum_of_squares += value * value;
-                    resampled_sample_count += 1;
+                    if let Some(chunk) = chunk_buffer.push(resampled) {
+                        // チャンク完成時だけログを出す（毎サンプルの println はしない）。
+                        // 将来はここで chunk を Whisper へ渡す。今は表示のみで破棄する。
+                        let rms = chunk_rms(&chunk);
+                        println!("Generated audio chunk: {} samples", chunk.len());
+                        println!("Chunk RMS: {rms:.6}");
+                    }
                 });
-            }
-
-            // 変換後サンプル数（16kHz）を基準に約1秒ごとに表示する。
-            if resampled_sample_count >= report_threshold {
-                let resampled_rms = if resampled_sample_count > 0 {
-                    (resampled_sum_of_squares / resampled_sample_count as f64).sqrt()
-                } else {
-                    0.0
-                };
-                println!("Input: {input_rate} Hz, {channels} ch, {format_label}");
-                println!(
-                    "Received input samples: {input_sample_count} | Mono samples: {mono_sample_count} | Resampled samples: {resampled_sample_count} | Resampled RMS: {resampled_rms:.6}"
-                );
-
-                input_sample_count = 0;
-                mono_sample_count = 0;
-                resampled_sample_count = 0;
-                resampled_sum_of_squares = 0.0;
             }
         },
         move |error| eprintln!("音声ストリームでエラーが発生しました: {error}"),
@@ -229,32 +250,21 @@ fn open_loopback_stream() -> Result<cpal::Stream, String> {
 
     let stream = match sample_format {
         // f32 はそのまま(概ね -1.0〜1.0)。
-        SampleFormat::F32 => build_mono_monitoring_stream::<f32>(
-            &device,
-            &config,
-            sample_format,
-            resampler,
-            TARGET_SAMPLE_RATE,
-            |sample| sample as f64,
-        ),
+        SampleFormat::F32 => {
+            build_chunking_input_stream::<f32>(&device, &config, resampler, |sample| sample as f64)
+        }
         // i16 は最大値で割って正規化する。
-        SampleFormat::I16 => build_mono_monitoring_stream::<i16>(
-            &device,
-            &config,
-            sample_format,
-            resampler,
-            TARGET_SAMPLE_RATE,
-            |sample| sample as f64 / i16::MAX as f64,
-        ),
+        SampleFormat::I16 => {
+            build_chunking_input_stream::<i16>(&device, &config, resampler, |sample| {
+                sample as f64 / i16::MAX as f64
+            })
+        }
         // u16 は中央値(32768)を 0 として正規化する。
-        SampleFormat::U16 => build_mono_monitoring_stream::<u16>(
-            &device,
-            &config,
-            sample_format,
-            resampler,
-            TARGET_SAMPLE_RATE,
-            |sample| (sample as f64 - 32768.0) / 32768.0,
-        ),
+        SampleFormat::U16 => {
+            build_chunking_input_stream::<u16>(&device, &config, resampler, |sample| {
+                (sample as f64 - 32768.0) / 32768.0
+            })
+        }
         other => {
             return Err(format!(
                 "このデバイスのサンプル形式にはまだ対応していません: {other:?}"
