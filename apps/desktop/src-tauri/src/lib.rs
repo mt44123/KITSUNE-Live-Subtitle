@@ -223,10 +223,11 @@ fn transcribe_chunk(
 ) -> Result<(), String> {
     // CPU 向け最小構成: greedy sampling（best_of = 1）。
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    // 認識のみ。英語への翻訳はしない。
+    // 認識のみ。Whisper 自身の翻訳機能は使わず、英語の文字起こしをそのまま出す。
     params.set_translate(false);
-    // 言語は自動判定（日本語・英語のどちらも壊さない）。
-    params.set_language(Some("auto"));
+    // 現在の対象は英語配信。短い・不明瞭な音声で韓国語や日本語へ誤判定されるのを防ぐため、
+    // 言語は自動判定せず英語へ固定する。
+    params.set_language(Some("en"));
     // 各チャンクを独立扱いにし、直前チャンクのテキストをプロンプトに使わない。
     params.set_no_context(true);
     // タイムスタンプは不要。
