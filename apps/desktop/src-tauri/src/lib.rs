@@ -9,6 +9,9 @@ use whisper_rs::{
     WhisperState,
 };
 
+/// 翻訳レイヤー。Whisper の認識テキストを React へ届ける前に翻訳する独立モジュール。
+mod translation;
+
 /// 出力オーディオデバイスを列挙し、既定の出力デバイス名をターミナルに表示する。
 ///
 /// Phase 2 の Step 1/2 に相当する「デバイス確認」だけを行う。
@@ -298,8 +301,12 @@ fn incremental_transcription(previous: &str, current: &str) -> Option<String> {
 /// React 側へは全文ではなく、`previous_transcription`（前回の Whisper 認識全文）との差分だけを
 /// `incremental_transcription` で求めて emit する。Rolling window では毎秒ほぼ同じ文章が返る
 /// ため、増えた部分だけを送って重複表示を避ける。判定後は `previous_transcription` を最新全文へ
-/// 更新する（完全一致で emit しない場合も更新する）。emit の失敗はワーカーを止めず、1 回分だけ
-/// ログして継続する。
+/// 更新する（完全一致で emit しない場合も更新する）。
+///
+/// emit する直前に翻訳レイヤー（`translation::translate`）を通す。パイプラインは
+/// `Whisper → Translator → React` の順で、Whisper 側は翻訳の実装詳細を知らずに翻訳結果だけを
+/// 受け取る（現時点はダミー翻訳のため入力がそのまま返る）。emit の失敗はワーカーを止めず、
+/// 1 回分だけログして継続する。
 fn transcribe_chunk(
     app: &AppHandle,
     state: &mut WhisperState,
@@ -359,12 +366,16 @@ fn transcribe_chunk(
     let diff = incremental_transcription(previous_transcription, trimmed);
     *previous_transcription = trimmed.to_string();
 
-    // 差分があるときだけ最新字幕として React 側へ届ける（完全一致なら emit しない）。emit 失敗で
-    // ワーカー全体は落とさず、そのチャンク分だけログして次へ進む（推論と同じエラー方針に揃える）。
+    // 差分があるときだけ最新字幕として React 側へ届ける（完全一致なら emit しない）。
+    // React へ送る前に翻訳レイヤーを通す（Whisper → Translator → React）。Whisper 側は
+    // 翻訳の実装詳細を知らず、`translation::translate` を呼ぶだけ。現時点はダミー翻訳の
+    // ため入力がそのまま返る。emit 失敗でワーカー全体は落とさず、そのチャンク分だけログ
+    // して次へ進む（推論と同じエラー方針に揃える）。
     if let Some(text_to_emit) = diff {
+        let translated = translation::translate(&text_to_emit);
         if let Err(error) = app.emit(
             TRANSCRIPTION_EVENT,
-            TranscriptionPayload { text: text_to_emit },
+            TranscriptionPayload { text: translated },
         ) {
             eprintln!("Failed to emit transcription event: {error}");
         }
