@@ -2,10 +2,10 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-// Phase 2: Rust の list_audio_devices コマンドを呼び出してデバイス名を表示する。
-// 音声取得（ループバックキャプチャ）はまだ実装しません。
-// ここでの useState は「表示状態」のためだけに使い、音声処理などの
-// ビジネスロジックは Rust 側に置きます（UI は呼び出しと表示のみ）。
+// Phase 2: Rust コマンドを呼び出す。
+// list_audio_devices で出力デバイス名を表示し、start_audio_capture で
+// ループバック取得を開始する。音声処理そのものは Rust 側に置き、
+// ここでは呼び出しと表示状態の管理だけを行う（UI は表示のみ）。
 
 const INPUT_LANGUAGES = ["Auto Detect", "English", "Japanese", "Korean"];
 const TARGET_LANGUAGES = ["Japanese", "English", "Korean"];
@@ -15,9 +15,23 @@ function App() {
   const [inputLanguage, setInputLanguage] = useState("Auto Detect");
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
 
+  const [captureError, setCaptureError] = useState<string | null>(null);
+
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [isCheckingDevices, setIsCheckingDevices] = useState(false);
   const [deviceError, setDeviceError] = useState<string | null>(null);
+
+  const startCapture = async () => {
+    setCaptureError(null);
+    try {
+      await invoke("start_audio_capture");
+      setIsCapturing(true);
+    } catch (error) {
+      setCaptureError(
+        typeof error === "string" ? error : "音声キャプチャの開始に失敗しました。"
+      );
+    }
+  };
 
   const checkAudioDevices = async () => {
     setIsCheckingDevices(true);
@@ -51,10 +65,13 @@ function App() {
         <button
           type="button"
           className="capture-button"
-          onClick={() => setIsCapturing((capturing) => !capturing)}
+          onClick={startCapture}
+          disabled={isCapturing}
         >
-          {isCapturing ? "Stop Capture" : "Start Capture"}
+          {isCapturing ? "Capturing..." : "Start Capture"}
         </button>
+
+        {captureError && <p className="device-error">{captureError}</p>}
 
         <button
           type="button"
