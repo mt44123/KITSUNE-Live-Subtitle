@@ -2,7 +2,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, StreamConfig};
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
 /// 出力オーディオデバイスを列挙し、既定の出力デバイス名をターミナルに表示する。
 ///
@@ -59,47 +58,67 @@ fn list_audio_devices() -> Result<Vec<String>, String> {
     Ok(device_names)
 }
 
-/// ループバック用の入力ストリームを構築する。
+/// ループバック用の入力ストリームを構築する（Whisper 前処理の第一段階: モノラル化検証）。
 ///
-/// コールバックでは受け取ったサンプル数を数え、あわせて音量(RMS)を集計し、
-/// 約1秒ごとに `Received samples: N | RMS: x.xxxxxx` の形式で表示する。
-/// （毎コールバックで表示すると大量に出力されるため、1秒間隔にまとめている。）
+/// コールバックでは、インターリーブされた入力をフレーム単位（1フレーム = 全チャンネル）で
+/// モノラル1サンプルへ平均し、モノラル後の RMS を集計する。約1秒分（実際の sample_rate 分）の
+/// モノラルサンプルが貯まるたびに、使用設定と集計結果を表示してカウンターをリセットする。
 ///
 /// サンプル形式(f32 / i16 / u16)ごとに同じ処理を使い回すためジェネリックにし、
 /// 各形式を概ね -1.0〜1.0 に正規化する関数 `normalize` を引数で受け取る。
-fn build_counting_input_stream<T>(
+/// チャンネル数・サンプルレート・形式は固定せず、実際の StreamConfig から受け取る。
+fn build_mono_monitoring_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
+    sample_format: SampleFormat,
     normalize: fn(T) -> f64,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + 'static,
 {
-    let mut sample_count: usize = 0;
-    let mut sum_of_squares: f64 = 0.0;
-    let mut last_report = Instant::now();
+    // 実際のデバイス設定から取得する（48kHz/2ch を固定しない）。
+    // チャンネル数が 0 でも chunks_exact(0) で panic しないよう最低 1 とする。
+    let channels = config.channels.max(1) as usize;
+    let sample_rate = (config.sample_rate as usize).max(1);
+    let format_label = format!("{sample_format:?}");
+
+    // 集計値。ストリーム生成のたびに新規初期化されるので、再 Start で持ち越さない。
+    let mut input_sample_count: usize = 0;
+    let mut mono_sample_count: usize = 0;
+    let mut mono_sum_of_squares: f64 = 0.0;
 
     device.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _info| {
-            sample_count += data.len();
-            for &sample in data {
-                let value = normalize(sample);
-                sum_of_squares += value * value;
+            input_sample_count += data.len();
+
+            // 1フレーム = channels 個。末尾の不完全フレームは chunks_exact が無視する。
+            for frame in data.chunks_exact(channels) {
+                let mut frame_sum = 0.0f64;
+                for &sample in frame {
+                    // 正規化後、安全のため -1.0..=1.0 に収める。
+                    frame_sum += normalize(sample).clamp(-1.0, 1.0);
+                }
+                let mono = frame_sum / channels as f64;
+                mono_sum_of_squares += mono * mono;
+                mono_sample_count += 1;
             }
 
-            if last_report.elapsed() >= Duration::from_secs(1) {
-                // RMS = sqrt(二乗和 / サンプル数)。サンプルが無い場合は 0 とする。
-                let rms = if sample_count > 0 {
-                    (sum_of_squares / sample_count as f64).sqrt()
+            // 実際の sample_rate を基準に約1秒ごとに表示する。
+            if mono_sample_count >= sample_rate {
+                let mono_rms = if mono_sample_count > 0 {
+                    (mono_sum_of_squares / mono_sample_count as f64).sqrt()
                 } else {
                     0.0
                 };
-                println!("Received samples: {sample_count} | RMS: {rms:.6}");
+                println!("Input: {sample_rate} Hz, {channels} ch, {format_label}");
+                println!(
+                    "Received input samples: {input_sample_count} | Mono samples: {mono_sample_count} | Mono RMS: {mono_rms:.6}"
+                );
 
-                sample_count = 0;
-                sum_of_squares = 0.0;
-                last_report = Instant::now();
+                input_sample_count = 0;
+                mono_sample_count = 0;
+                mono_sum_of_squares = 0.0;
             }
         },
         move |error| eprintln!("音声ストリームでエラーが発生しました: {error}"),
@@ -129,26 +148,40 @@ fn open_loopback_stream() -> Result<cpal::Stream, String> {
     let sample_format = default_config.sample_format();
     let config: StreamConfig = default_config.config();
 
+    // 開始時に実際に使用する設定を一度だけ表示する。
+    println!(
+        "Loopback config: {} Hz, {} channels, {:?}",
+        config.sample_rate, config.channels, sample_format
+    );
+
     let stream = match sample_format {
         // f32 はそのまま(概ね -1.0〜1.0)。
         SampleFormat::F32 => {
-            build_counting_input_stream::<f32>(&device, &config, |sample| sample as f64)
+            build_mono_monitoring_stream::<f32>(&device, &config, sample_format, |sample| {
+                sample as f64
+            })
         }
         // i16 は最大値で割って正規化する。
-        SampleFormat::I16 => build_counting_input_stream::<i16>(&device, &config, |sample| {
-            sample as f64 / i16::MAX as f64
-        }),
+        SampleFormat::I16 => {
+            build_mono_monitoring_stream::<i16>(&device, &config, sample_format, |sample| {
+                sample as f64 / i16::MAX as f64
+            })
+        }
         // u16 は中央値(32768)を 0 として正規化する。
-        SampleFormat::U16 => build_counting_input_stream::<u16>(&device, &config, |sample| {
-            (sample as f64 - 32768.0) / 32768.0
-        }),
+        SampleFormat::U16 => {
+            build_mono_monitoring_stream::<u16>(&device, &config, sample_format, |sample| {
+                (sample as f64 - 32768.0) / 32768.0
+            })
+        }
         other => {
             return Err(format!(
                 "このデバイスのサンプル形式にはまだ対応していません: {other:?}"
             ))
         }
     }
-    .map_err(|error| format!("ループバック用の入力ストリームを作成できませんでした。詳細: {error}"))?;
+    .map_err(|error| {
+        format!("ループバック用の入力ストリームを作成できませんでした。詳細: {error}")
+    })?;
 
     stream
         .play()
