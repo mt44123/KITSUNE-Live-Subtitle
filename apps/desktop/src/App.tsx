@@ -10,11 +10,21 @@ import "./App.css";
 const INPUT_LANGUAGES = ["Auto Detect", "English", "Japanese", "Korean"];
 const TARGET_LANGUAGES = ["Japanese", "English", "Korean"];
 
+// キャプチャの状態。idle=未開始, starting=開始処理中, capturing=取得中, stopping=停止処理中。
+type CaptureStatus = "idle" | "starting" | "capturing" | "stopping";
+
+const CAPTURE_BUTTON_LABEL: Record<CaptureStatus, string> = {
+  idle: "Start Capture",
+  starting: "Starting...",
+  capturing: "Stop Capture",
+  stopping: "Stopping...",
+};
+
 function App() {
-  const [isCapturing, setIsCapturing] = useState(false);
   const [inputLanguage, setInputLanguage] = useState("Auto Detect");
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
 
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [captureError, setCaptureError] = useState<string | null>(null);
 
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
@@ -23,15 +33,44 @@ function App() {
 
   const startCapture = async () => {
     setCaptureError(null);
+    setCaptureStatus("starting");
     try {
+      // Rust 側は Stream の play() 成功後に Ok を返すため、成功後に capturing へ。
       await invoke("start_audio_capture");
-      setIsCapturing(true);
+      setCaptureStatus("capturing");
     } catch (error) {
+      setCaptureStatus("idle");
       setCaptureError(
         typeof error === "string" ? error : "音声キャプチャの開始に失敗しました。"
       );
     }
   };
+
+  const stopCapture = async () => {
+    setCaptureError(null);
+    setCaptureStatus("stopping");
+    try {
+      await invoke("stop_audio_capture");
+      setCaptureStatus("idle");
+    } catch (error) {
+      // 停止に失敗した場合は取得中の表示に戻す。
+      setCaptureStatus("capturing");
+      setCaptureError(
+        typeof error === "string" ? error : "音声キャプチャの停止に失敗しました。"
+      );
+    }
+  };
+
+  const handleCaptureButtonClick = () => {
+    if (captureStatus === "idle") {
+      startCapture();
+    } else if (captureStatus === "capturing") {
+      stopCapture();
+    }
+  };
+
+  const isCaptureTransitioning =
+    captureStatus === "starting" || captureStatus === "stopping";
 
   const checkAudioDevices = async () => {
     setIsCheckingDevices(true);
@@ -65,10 +104,10 @@ function App() {
         <button
           type="button"
           className="capture-button"
-          onClick={startCapture}
-          disabled={isCapturing}
+          onClick={handleCaptureButtonClick}
+          disabled={isCaptureTransitioning}
         >
-          {isCapturing ? "Capturing..." : "Start Capture"}
+          {CAPTURE_BUTTON_LABEL[captureStatus]}
         </button>
 
         {captureError && <p className="device-error">{captureError}</p>}
