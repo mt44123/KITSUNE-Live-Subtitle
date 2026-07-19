@@ -58,11 +58,68 @@ fn list_audio_devices() -> Result<Vec<String>, String> {
     Ok(device_names)
 }
 
-/// ループバック用の入力ストリームを構築する（Whisper 前処理の第一段階: モノラル化検証）。
+/// Whisper 前処理で使う出力サンプルレート（16kHz モノラル）。
+const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+/// モノラル音声を任意の入力レートから 16kHz へ変換する線形補間リサンプラー。
 ///
-/// コールバックでは、インターリーブされた入力をフレーム単位（1フレーム = 全チャンネル）で
-/// モノラル1サンプルへ平均し、モノラル後の RMS を集計する。約1秒分（実際の sample_rate 分）の
-/// モノラルサンプルが貯まるたびに、使用設定と集計結果を表示してカウンターをリセットする。
+/// 方式B（位相アキュムレータ）: 入力を1サンプルずつ受け取り、常に「現在サンプルを 0、
+/// 直前サンプルを -1」とする相対座標で次の出力位置 `next_out_offset` を保持する。
+/// 新しい入力が来るたびに座標を1つずらす（-1.0）ことで、座標が無制限に増えず精度も安定する。
+/// 状態はコールバック間で保持し、チャンク境界をまたいでも連続性が保たれる。
+struct LinearResampler {
+    /// 入力レート / 出力レート。1 出力あたりに進む入力サンプル数。
+    step: f64,
+    /// 次に生成する出力サンプルの位置（現在の入力サンプルを 0 とした相対座標）。
+    next_out_offset: f64,
+    /// 直前に受け取った入力サンプル（相対座標 -1 の値）。
+    prev_sample: f64,
+}
+
+impl LinearResampler {
+    /// 入力・出力レートからリサンプラーを作る。レートが 0 の場合は Err を返す。
+    fn new(input_rate: u32, output_rate: u32) -> Result<Self, String> {
+        if input_rate == 0 {
+            return Err(
+                "入力サンプルレートが 0 です。オーディオデバイスの設定を確認してください。"
+                    .to_string(),
+            );
+        }
+        if output_rate == 0 {
+            return Err("出力サンプルレート(16000)が不正です。".to_string());
+        }
+        Ok(Self {
+            step: input_rate as f64 / output_rate as f64,
+            // 最初の入力サンプルで -1.0 されて 0 になり、出力位置 0（＝先頭サンプル）から生成する。
+            next_out_offset: 1.0,
+            prev_sample: 0.0,
+        })
+    }
+
+    /// 入力モノラルサンプルを1つ処理し、生成された 16kHz サンプルを `on_output` へ渡す。
+    ///
+    /// 出力は f32（概ね -1.0..=1.0 に clamp 済み）。1サンプルにつき 0 個以上を生成する
+    /// （ダウンサンプル時は数サンプルに1個、アップサンプル時は複数個）。
+    fn process_sample<F: FnMut(f32)>(&mut self, sample: f64, mut on_output: F) {
+        // 新しい入力サンプルが来たので、次出力位置を現在サンプル基準へ1つずらす。
+        self.next_out_offset -= 1.0;
+        // 直前サンプル(-1)と現在サンプル(0)の間に入る出力を線形補間で生成する。
+        while self.next_out_offset <= 0.0 {
+            let fraction = self.next_out_offset + 1.0; // 直前サンプルからの距離 [0.0, 1.0]
+            let interpolated = self.prev_sample + (sample - self.prev_sample) * fraction;
+            on_output((interpolated as f32).clamp(-1.0, 1.0));
+            self.next_out_offset += self.step;
+        }
+        self.prev_sample = sample;
+    }
+}
+
+/// ループバック用の入力ストリームを構築する（Whisper 前処理: モノラル化 + 16kHz リサンプリング検証）。
+///
+/// コールバックでは、インターリーブ入力をフレーム単位（1フレーム = 全チャンネル）でモノラル化し、
+/// それを線形補間リサンプラーへ順番に渡して 16kHz へ変換、変換後サンプルの RMS を集計する。
+/// 約1秒分（変換後 16000 サンプル）貯まるたびに設定と集計結果を表示し、集計値だけをリセットする
+/// （リサンプラーの位相・前回サンプルなどの連続状態はリセットしない）。
 ///
 /// サンプル形式(f32 / i16 / u16)ごとに同じ処理を使い回すためジェネリックにし、
 /// 各形式を概ね -1.0〜1.0 に正規化する関数 `normalize` を引数で受け取る。
@@ -71,6 +128,8 @@ fn build_mono_monitoring_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
+    mut resampler: LinearResampler,
+    output_rate: u32,
     normalize: fn(T) -> f64,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -79,13 +138,16 @@ where
     // 実際のデバイス設定から取得する（48kHz/2ch を固定しない）。
     // チャンネル数が 0 でも chunks_exact(0) で panic しないよう最低 1 とする。
     let channels = config.channels.max(1) as usize;
-    let sample_rate = (config.sample_rate as usize).max(1);
+    let input_rate = (config.sample_rate as usize).max(1);
     let format_label = format!("{sample_format:?}");
+    // 表示判定は変換後サンプル数を基準にする。
+    let report_threshold = (output_rate as usize).max(1);
 
-    // 集計値。ストリーム生成のたびに新規初期化されるので、再 Start で持ち越さない。
+    // ログ集計値。ストリーム生成のたびに新規初期化され、再 Start で持ち越さない。
     let mut input_sample_count: usize = 0;
     let mut mono_sample_count: usize = 0;
-    let mut mono_sum_of_squares: f64 = 0.0;
+    let mut resampled_sample_count: usize = 0;
+    let mut resampled_sum_of_squares: f64 = 0.0;
 
     device.build_input_stream::<T, _, _>(
         config,
@@ -100,25 +162,32 @@ where
                     frame_sum += normalize(sample).clamp(-1.0, 1.0);
                 }
                 let mono = frame_sum / channels as f64;
-                mono_sum_of_squares += mono * mono;
                 mono_sample_count += 1;
+
+                // モノラルサンプルを 16kHz へ変換し、変換後サンプルだけを集計する。
+                resampler.process_sample(mono, |resampled| {
+                    let value = resampled as f64;
+                    resampled_sum_of_squares += value * value;
+                    resampled_sample_count += 1;
+                });
             }
 
-            // 実際の sample_rate を基準に約1秒ごとに表示する。
-            if mono_sample_count >= sample_rate {
-                let mono_rms = if mono_sample_count > 0 {
-                    (mono_sum_of_squares / mono_sample_count as f64).sqrt()
+            // 変換後サンプル数（16kHz）を基準に約1秒ごとに表示する。
+            if resampled_sample_count >= report_threshold {
+                let resampled_rms = if resampled_sample_count > 0 {
+                    (resampled_sum_of_squares / resampled_sample_count as f64).sqrt()
                 } else {
                     0.0
                 };
-                println!("Input: {sample_rate} Hz, {channels} ch, {format_label}");
+                println!("Input: {input_rate} Hz, {channels} ch, {format_label}");
                 println!(
-                    "Received input samples: {input_sample_count} | Mono samples: {mono_sample_count} | Mono RMS: {mono_rms:.6}"
+                    "Received input samples: {input_sample_count} | Mono samples: {mono_sample_count} | Resampled samples: {resampled_sample_count} | Resampled RMS: {resampled_rms:.6}"
                 );
 
                 input_sample_count = 0;
                 mono_sample_count = 0;
-                mono_sum_of_squares = 0.0;
+                resampled_sample_count = 0;
+                resampled_sum_of_squares = 0.0;
             }
         },
         move |error| eprintln!("音声ストリームでエラーが発生しました: {error}"),
@@ -154,25 +223,38 @@ fn open_loopback_stream() -> Result<cpal::Stream, String> {
         config.sample_rate, config.channels, sample_format
     );
 
+    // 実際の入力レートから 16kHz へのリサンプラーを作る（Start ごとに新規＝状態を持ち越さない）。
+    // レートが不正な場合はここで分かりやすい Err を返す。
+    let resampler = LinearResampler::new(config.sample_rate, TARGET_SAMPLE_RATE)?;
+
     let stream = match sample_format {
         // f32 はそのまま(概ね -1.0〜1.0)。
-        SampleFormat::F32 => {
-            build_mono_monitoring_stream::<f32>(&device, &config, sample_format, |sample| {
-                sample as f64
-            })
-        }
+        SampleFormat::F32 => build_mono_monitoring_stream::<f32>(
+            &device,
+            &config,
+            sample_format,
+            resampler,
+            TARGET_SAMPLE_RATE,
+            |sample| sample as f64,
+        ),
         // i16 は最大値で割って正規化する。
-        SampleFormat::I16 => {
-            build_mono_monitoring_stream::<i16>(&device, &config, sample_format, |sample| {
-                sample as f64 / i16::MAX as f64
-            })
-        }
+        SampleFormat::I16 => build_mono_monitoring_stream::<i16>(
+            &device,
+            &config,
+            sample_format,
+            resampler,
+            TARGET_SAMPLE_RATE,
+            |sample| sample as f64 / i16::MAX as f64,
+        ),
         // u16 は中央値(32768)を 0 として正規化する。
-        SampleFormat::U16 => {
-            build_mono_monitoring_stream::<u16>(&device, &config, sample_format, |sample| {
-                (sample as f64 - 32768.0) / 32768.0
-            })
-        }
+        SampleFormat::U16 => build_mono_monitoring_stream::<u16>(
+            &device,
+            &config,
+            sample_format,
+            resampler,
+            TARGET_SAMPLE_RATE,
+            |sample| (sample as f64 - 32768.0) / 32768.0,
+        ),
         other => {
             return Err(format!(
                 "このデバイスのサンプル形式にはまだ対応していません: {other:?}"
