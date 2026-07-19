@@ -22,4 +22,10 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Cross-platform audio device access. Phase 2 では、まずデバイス列挙のみに使用する
+# （ループバックキャプチャは後続ステップで実装する）。
+# 0.17 系に固定する理由: 最新の 0.18.x は `windows-core` を独自依存に持ち、
+# Tauri が固定する `windows 0.61` と衝突してビルドが壊れる。0.17 は `windows`
+# 本体のみに依存するため Tauri と同じバージョンに一本化でき、追加依存も増えない。
+cpal = "0.17.0"
 

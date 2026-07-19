@@ -1,10 +1,11 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-// Phase 1: 初期UIのみ。
-// 音声取得やTauri(Rust)処理はまだ実装しません。
-// ここでの useState は「ボタン表示の切り替え」という画面状態のためだけに使い、
-// 実際の音声処理などのビジネスロジックは含めません。
+// Phase 2: Rust の list_audio_devices コマンドを呼び出してデバイス名を表示する。
+// 音声取得（ループバックキャプチャ）はまだ実装しません。
+// ここでの useState は「表示状態」のためだけに使い、音声処理などの
+// ビジネスロジックは Rust 側に置きます（UI は呼び出しと表示のみ）。
 
 const INPUT_LANGUAGES = ["Auto Detect", "English", "Japanese", "Korean"];
 const TARGET_LANGUAGES = ["Japanese", "English", "Korean"];
@@ -13,6 +14,26 @@ function App() {
   const [isCapturing, setIsCapturing] = useState(false);
   const [inputLanguage, setInputLanguage] = useState("Auto Detect");
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
+
+  const [outputDevices, setOutputDevices] = useState<string[]>([]);
+  const [isCheckingDevices, setIsCheckingDevices] = useState(false);
+  const [deviceError, setDeviceError] = useState<string | null>(null);
+
+  const checkAudioDevices = async () => {
+    setIsCheckingDevices(true);
+    setDeviceError(null);
+    try {
+      const devices = await invoke<string[]>("list_audio_devices");
+      setOutputDevices(devices);
+    } catch (error) {
+      setOutputDevices([]);
+      setDeviceError(
+        typeof error === "string" ? error : "デバイスの取得に失敗しました。"
+      );
+    } finally {
+      setIsCheckingDevices(false);
+    }
+  };
 
   return (
     <main className="app">
@@ -34,6 +55,30 @@ function App() {
         >
           {isCapturing ? "Stop Capture" : "Start Capture"}
         </button>
+
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={checkAudioDevices}
+          disabled={isCheckingDevices}
+        >
+          {isCheckingDevices ? "Checking..." : "Check Audio Device"}
+        </button>
+
+        {deviceError && <p className="device-error">{deviceError}</p>}
+
+        {outputDevices.length > 0 && (
+          <div className="device-list">
+            <h3 className="device-list-title">Available Output Devices</h3>
+            <ul className="device-list-items">
+              {outputDevices.map((device) => (
+                <li key={device} className="device-list-item">
+                  {device}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </section>
 
       <section className="panel">

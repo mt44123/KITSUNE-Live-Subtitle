@@ -122,6 +122,72 @@ body {
   background-color: #f59a33;
 }
 
+.secondary-button {
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid #333a47;
+  background-color: #12151a;
+  color: #e6e6e6;
+  font-size: 0.95rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+.secondary-button:hover:not(:disabled) {
+  border-color: #ffa94d;
+  background-color: #171b21;
+}
+
+.secondary-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.device-error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: #ff8f8f;
+  background-color: #2a1c1c;
+  border: 1px solid #4a2f2f;
+}
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device-list-title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8b93a1;
+}
+
+.device-list-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.device-list-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background-color: #12151a;
+  border: 1px solid #2a2f3a;
+  font-size: 0.92rem;
+  color: #e6e6e6;
+}
+
 .subtitle-preview {
   gap: 8px;
 }
