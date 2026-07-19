@@ -1,49 +1,82 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+// Phase 1: 初期UIのみ。
+// 音声取得やTauri(Rust)処理はまだ実装しません。
+// ここでの useState は「ボタン表示の切り替え」という画面状態のためだけに使い、
+// 実際の音声処理などのビジネスロジックは含めません。
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+const INPUT_LANGUAGES = ["Auto Detect", "English", "Japanese", "Korean"];
+const TARGET_LANGUAGES = ["Japanese", "English", "Korean"];
+
+function App() {
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [inputLanguage, setInputLanguage] = useState("Auto Detect");
+  const [targetLanguage, setTargetLanguage] = useState("Japanese");
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <main className="app">
+      <header className="app-header">
+        <h1 className="app-title">KITSUNE Live Subtitle</h1>
+        <span className="app-status">Ready</span>
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      <section className="panel">
+        <h2 className="panel-title">Audio Source</h2>
+        <div className="field-row">
+          <span className="field-label">Source</span>
+          <span className="field-value">System Audio</span>
+        </div>
+        <button
+          type="button"
+          className="capture-button"
+          onClick={() => setIsCapturing((capturing) => !capturing)}
+        >
+          {isCapturing ? "Stop Capture" : "Start Capture"}
+        </button>
+      </section>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      <section className="panel">
+        <h2 className="panel-title">Language</h2>
+
+        <label className="field-row" htmlFor="input-language">
+          <span className="field-label">Input</span>
+          <select
+            id="input-language"
+            className="select"
+            value={inputLanguage}
+            onChange={(event) => setInputLanguage(event.target.value)}
+          >
+            {INPUT_LANGUAGES.map((language) => (
+              <option key={language} value={language}>
+                {language}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="field-row" htmlFor="target-language">
+          <span className="field-label">Translate to</span>
+          <select
+            id="target-language"
+            className="select"
+            value={targetLanguage}
+            onChange={(event) => setTargetLanguage(event.target.value)}
+          >
+            {TARGET_LANGUAGES.map((language) => (
+              <option key={language} value={language}>
+                {language}
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
+
+      <section className="panel subtitle-preview">
+        <h2 className="panel-title">Subtitle Preview</h2>
+        <p className="subtitle-original">Let's go!</p>
+        <p className="subtitle-translated">行くぞ！</p>
+      </section>
     </main>
   );
 }
