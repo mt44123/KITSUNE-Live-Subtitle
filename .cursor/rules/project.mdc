@@ -1,0 +1,30 @@
+---
+description: Architecture and coding standards for KITSUNE Subtitle
+alwaysApply: true
+---
+
+# KITSUNE Subtitle Standards
+
+## Required Reading
+
+- Read `PROJECT_CONSTITUTION.md` before implementing features.
+- Read `ARCHITECTURE.md` before making architectural decisions.
+- Read `AI_RULES.md` before generating code.
+
+## General Principles
+
+- Never implement features that are not requested.
+- Never invent architecture.
+- Never duplicate existing logic.
+- Prefer composition over inheritance.
+- Follow TypeScript best practices.
+- Follow Rust best practices.
+- Keep files under 400 lines whenever practical.
+- UI components must not contain business logic; business logic belongs outside React components.
+- Prefer reusable modules and descriptive names.
+- Avoid utility dumping grounds (no catch-all `utils` files).
+- Explain important implementation decisions.
+
+## When Unsure
+
+Ask instead of assuming.
